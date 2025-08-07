@@ -1011,6 +1011,26 @@ async function startVoiceCall() {
         // 启动自动连接监控
         startConnectionMonitoring();
         
+        // 快速网络连接检查（不阻塞通话流程）
+        setTimeout(async () => {
+            console.log('🔍 开始快速网络连接检查...');
+            try {
+                // 只测试一个TURN服务器以快速检查
+                const turnTest = await testTurnServer({
+                    urls: 'turn:openrelay.metered.ca:80',
+                    username: 'openrelayproject',
+                    credential: 'openrelayproject'
+                });
+                
+                if (!turnTest.success) {
+                    console.warn('⚠️ 快速TURN测试失败! 跨网络通话可能有问题');
+                    console.log('💡 运行 testNetworkConnectivity() 进行完整诊断');
+                }
+            } catch (error) {
+                console.warn('⚠️ 网络检查异常:', error);
+            }
+        }, 3000); // 3秒后开始检查，不影响通话启动
+        
         // 通知其他用户加入通话
         console.log('📞 发送通话邀请，roomId:', roomId, 'currentUserId:', currentUserId, 'currentUsername:', currentUsername);
         if (isRealtimeEnabled && window.realtimeClient) {
@@ -1569,8 +1589,10 @@ function createPeerConnection(userId) {
             { urls: 'stun:stunserver.org' },
             { urls: 'stun:stun.voiparound.com' },
             { urls: 'stun:stun.voipbuster.com' },
+            { urls: 'stun:stun.ekiga.net' },
+            { urls: 'stun:stun.ideasip.com' },
             
-            // 免费TURN服务器 (用于NAT穿透)
+            // 多个TURN服务器提供商 - 提高连接成功率
             {
                 urls: 'turn:openrelay.metered.ca:80',
                 username: 'openrelayproject',
@@ -1585,31 +1607,117 @@ function createPeerConnection(userId) {
                 urls: 'turn:openrelay.metered.ca:443?transport=tcp',
                 username: 'openrelayproject',
                 credential: 'openrelayproject'
+            },
+            {
+                urls: 'turns:openrelay.metered.ca:443',
+                username: 'openrelayproject',
+                credential: 'openrelayproject'
+            },
+            
+            // 备用免费TURN服务器
+            {
+                urls: 'turn:relay1.expressturn.com:3478',
+                username: 'ef4CVDZETE4TAMK426',
+                credential: 'ugBu0jkKWIE6tIGG'
+            },
+            {
+                urls: 'turns:relay1.expressturn.com:5349',
+                username: 'ef4CVDZETE4TAMK426',
+                credential: 'ugBu0jkKWIE6tIGG'
+            },
+            
+            // 更多免费TURN选项
+            {
+                urls: 'turn:numb.viagenie.ca:3478',
+                username: 'webrtc@live.com',
+                credential: 'muazkh'
+            },
+            {
+                urls: 'turns:numb.viagenie.ca:5349',
+                username: 'webrtc@live.com', 
+                credential: 'muazkh'
             }
         ],
-        iceCandidatePoolSize: 10,
+        iceCandidatePoolSize: 15, // 增加ICE候选池大小
         bundlePolicy: 'max-bundle',
-        rtcpMuxPolicy: 'require'
+        rtcpMuxPolicy: 'require',
+        iceTransportPolicy: 'all' // 允许所有传输类型
     };
+    
+    console.log('🔧 WebRTC配置详情:', {
+        STUN服务器数量: configuration.iceServers.filter(s => s.urls.includes('stun:')).length,
+        TURN服务器数量: configuration.iceServers.filter(s => s.urls.includes('turn:')).length,
+        TURNS服务器数量: configuration.iceServers.filter(s => s.urls.includes('turns:')).length,
+        ICE候选池大小: configuration.iceCandidatePoolSize
+    });
     
     const peerConnection = new RTCPeerConnection(configuration);
     
+    // 设置连接超时计时器
+    const connectionTimeout = setTimeout(() => {
+        if (peerConnection.iceConnectionState === 'new' || 
+            peerConnection.iceConnectionState === 'checking' ||
+            peerConnection.iceConnectionState === 'disconnected') {
+            console.error('⏰ ICE连接超时! 用户:', userId);
+            console.log('🔍 连接状态详情:', {
+                iceConnectionState: peerConnection.iceConnectionState,
+                connectionState: peerConnection.connectionState,
+                signalingState: peerConnection.signalingState,
+                iceGatheringState: peerConnection.iceGatheringState
+            });
+            
+            // 触发重连
+            handleConnectionTimeout(userId, peerConnection);
+        }
+    }, 30000); // 30秒超时
+    
+    // 保存超时器引用
+    peerConnection._connectionTimeout = connectionTimeout;
+    
     // 添加连接状态监控
     peerConnection.oniceconnectionstatechange = () => {
-        console.log('🔗 ICE连接状态变化:', peerConnection.iceConnectionState);
+        console.log('🔗 ICE连接状态变化:', peerConnection.iceConnectionState, '用户:', userId);
         
         switch (peerConnection.iceConnectionState) {
+            case 'checking':
+                console.log('🔍 ICE连接检查中...');
+                break;
             case 'connected':
             case 'completed':
-                console.log('✅ WebRTC连接建立成功');
+                console.log('✅ WebRTC连接建立成功! 用户:', userId);
+                // 清除超时器
+                if (peerConnection._connectionTimeout) {
+                    clearTimeout(peerConnection._connectionTimeout);
+                    peerConnection._connectionTimeout = null;
+                }
                 break;
             case 'disconnected':
-                console.warn('⚠️ WebRTC连接断开');
+                console.warn('⚠️ WebRTC连接断开, 用户:', userId);
+                // 启动重连计时器
+                setTimeout(() => {
+                    if (peerConnection.iceConnectionState === 'disconnected') {
+                        console.log('🔄 连接断开过久，尝试重连...');
+                        handleConnectionFailure(userId);
+                    }
+                }, 10000);
                 break;
             case 'failed':
-                console.error('❌ WebRTC连接失败');
-                // 可以尝试重新连接
+                console.error('❌ WebRTC连接失败, 用户:', userId);
+                // 清除超时器
+                if (peerConnection._connectionTimeout) {
+                    clearTimeout(peerConnection._connectionTimeout);
+                    peerConnection._connectionTimeout = null;
+                }
+                // 尝试重新连接
                 handleConnectionFailure(userId);
+                break;
+            case 'closed':
+                console.log('🔒 WebRTC连接已关闭, 用户:', userId);
+                // 清除超时器
+                if (peerConnection._connectionTimeout) {
+                    clearTimeout(peerConnection._connectionTimeout);
+                    peerConnection._connectionTimeout = null;
+                }
                 break;
         }
     };
@@ -1791,18 +1899,39 @@ function createPeerConnection(userId) {
         console.log('📡 ===== 远程音频流处理完成 =====');
     };
     
-    // 处理ICE候选 - 增强日志
+    // 处理ICE候选 - 增强日志和统计
+    let candidateStats = {
+        host: 0,
+        srflx: 0,  // STUN候选
+        relay: 0   // TURN候选
+    };
+    
     peerConnection.onicecandidate = (event) => {
         if (event.candidate) {
+            const candidate = event.candidate;
+            
+            // 统计候选类型
+            if (candidateStats[candidate.type] !== undefined) {
+                candidateStats[candidate.type]++;
+            }
+            
             console.log('🧊 收集到ICE候选:', {
                 用户ID: userId,
-                候选类型: event.candidate.type,
-                协议: event.candidate.protocol,
-                地址: event.candidate.address,
-                端口: event.candidate.port,
-                foundation: event.candidate.foundation,
-                priority: event.candidate.priority
+                候选类型: candidate.type,
+                协议: candidate.protocol,
+                地址: candidate.address,
+                端口: candidate.port,
+                foundation: candidate.foundation,
+                priority: candidate.priority,
+                relatedAddress: candidate.relatedAddress,
+                relatedPort: candidate.relatedPort,
+                统计: candidateStats
             });
+            
+            // 特别标注TURN候选
+            if (candidate.type === 'relay') {
+                console.log('🎉 重要: 收集到TURN候选(relay)! 这对跨网络通话至关重要');
+            }
             
             if (isRealtimeEnabled && window.realtimeClient) {
                 window.realtimeClient.sendIceCandidate({
@@ -1811,12 +1940,25 @@ function createPeerConnection(userId) {
                     candidate: event.candidate,
                     fromUserId: currentUserId
                 });
-                console.log('📤 已发送ICE候选给用户:', userId);
+                console.log('📤 已发送ICE候选给用户:', userId, '类型:', candidate.type);
             } else {
                 console.error('❌ 无法发送ICE候选 - 实时通信未启用');
             }
         } else {
             console.log('🏁 ICE候选收集完成 - 用户:', userId);
+            console.log('📊 最终候选统计:', {
+                用户ID: userId,
+                host候选: candidateStats.host,
+                STUN候选: candidateStats.srflx,
+                TURN候选: candidateStats.relay,
+                总计: candidateStats.host + candidateStats.srflx + candidateStats.relay
+            });
+            
+            // 如果没有TURN候选，发出警告
+            if (candidateStats.relay === 0) {
+                console.warn('⚠️ 警告: 没有收集到TURN候选! 跨网络通话可能失败');
+                console.warn('💡 建议: 运行 testNetworkConnectivity() 检查TURN服务器连接');
+            }
         }
     };
     
@@ -1824,30 +1966,125 @@ function createPeerConnection(userId) {
     return peerConnection;
 }
 
-// 处理连接失败
+// 处理连接超时
+function handleConnectionTimeout(userId, peerConnection) {
+    console.log('⏰ ===== 处理连接超时 =====');
+    console.log('👤 用户ID:', userId);
+    console.log('🔍 超时时连接状态:', {
+        iceConnectionState: peerConnection.iceConnectionState,
+        connectionState: peerConnection.connectionState,
+        signalingState: peerConnection.signalingState,
+        iceGatheringState: peerConnection.iceGatheringState
+    });
+    
+    // 尝试ICE重启
+    if (peerConnection.signalingState === 'stable') {
+        console.log('🔄 尝试ICE重启...');
+        try {
+            peerConnection.restartIce();
+            console.log('✅ ICE重启请求已发送');
+        } catch (error) {
+            console.error('❌ ICE重启失败:', error);
+            handleConnectionFailure(userId);
+        }
+    } else {
+        console.log('⚠️ 信令状态不稳定，直接重建连接');
+        handleConnectionFailure(userId);
+    }
+    
+    console.log('⏰ ===== 连接超时处理完成 =====');
+}
+
+// 处理连接失败 - 增强版
 function handleConnectionFailure(userId) {
-    console.log('🔄 尝试重新建立连接:', userId);
+    console.log('🔄 ===== 处理连接失败 =====');
+    console.log('👤 用户ID:', userId);
     
     const peerConnection = peerConnections.get(userId);
     if (peerConnection) {
+        // 清除超时器
+        if (peerConnection._connectionTimeout) {
+            clearTimeout(peerConnection._connectionTimeout);
+            peerConnection._connectionTimeout = null;
+        }
+        
+        // 记录失败前的状态
+        console.log('📊 失败前连接状态:', {
+            iceConnectionState: peerConnection.iceConnectionState,
+            connectionState: peerConnection.connectionState,
+            signalingState: peerConnection.signalingState,
+            iceGatheringState: peerConnection.iceGatheringState
+        });
+        
         // 关闭失败的连接
         peerConnection.close();
         peerConnections.delete(userId);
         
+        // 移除对应的远程流
+        if (remoteStreams.has(userId)) {
+            remoteStreams.delete(userId);
+            console.log('🗑️ 移除远程流:', userId);
+        }
+        
         // 移除对应的音频元素
         const audioElement = document.getElementById(`remote-audio-${userId}`);
         if (audioElement) {
+            audioElement.pause();
+            audioElement.srcObject = null;
             audioElement.remove();
+            console.log('🗑️ 移除音频元素:', userId);
         }
         
-        // 短暂延迟后尝试重新连接
-        setTimeout(() => {
-            if (isInCall && callParticipants.has(userId)) {
-                console.log('🔄 重新创建WebRTC连接:', userId);
-                createPeerConnection(userId);
-            }
-        }, 2000);
+        console.log('🧹 连接资源清理完成');
+        
+        // 检查是否还在通话中且用户还在参与者列表中
+        if (isInCall && callParticipants.has(userId)) {
+            console.log('🔄 准备重新建立连接...');
+            
+            // 短暂延迟后尝试重新连接
+            setTimeout(() => {
+                if (isInCall && callParticipants.has(userId)) {
+                    console.log('🔄 开始重新建立WebRTC连接:', userId);
+                    
+                    // 重新创建连接
+                    const newPeerConnection = createPeerConnection(userId);
+                    
+                    // 如果我是发起方，重新发送offer
+                    if (currentUserId < userId) { // 简单的排序规则确定谁发起
+                        console.log('📤 我是发起方，重新发送Offer...');
+                        setTimeout(async () => {
+                            try {
+                                const offer = await newPeerConnection.createOffer();
+                                await newPeerConnection.setLocalDescription(offer);
+                                
+                                if (isRealtimeEnabled && window.realtimeClient) {
+                                    window.realtimeClient.sendCallOffer({
+                                        roomId,
+                                        targetUserId: userId,
+                                        offer: newPeerConnection.localDescription,
+                                        fromUserId: currentUserId
+                                    });
+                                    console.log('✅ 重连Offer已发送');
+                                }
+                            } catch (error) {
+                                console.error('❌ 重连Offer创建失败:', error);
+                            }
+                        }, 1000);
+                    }
+                    
+                    showToast('正在尝试重新连接...', 'warning');
+                } else {
+                    console.log('⚠️ 通话已结束或用户已离开，取消重连');
+                }
+            }, 3000); // 3秒延迟重连
+        } else {
+            console.log('⚠️ 不在通话中或用户不在参与者列表，跳过重连');
+        }
+    } else {
+        console.warn('⚠️ 找不到要处理的连接');
     }
+    
+    console.log('🔄 ===== 连接失败处理完成 =====');
 }
 
 // 处理通话邀请
@@ -5479,6 +5716,224 @@ function debugWebRTCConnections() {
 
 // 将调试函数暴露到全局，方便开发者调用
 window.debugWebRTC = debugWebRTCConnections;
+
+// 网络环境诊断功能
+window.testNetworkConnectivity = async function() {
+    console.log('🔍 ===== 开始网络连接诊断 =====');
+    
+    const results = {
+        stun: [],
+        turn: [],
+        summary: {
+            stunWorking: 0,
+            stunFailed: 0,
+            turnWorking: 0,
+            turnFailed: 0
+        }
+    };
+    
+    // 测试STUN服务器
+    const stunServers = [
+        'stun:stun.l.google.com:19302',
+        'stun:stun1.l.google.com:19302',
+        'stun:stunserver.org',
+        'stun:stun.ekiga.net'
+    ];
+    
+    console.log('🧪 测试STUN服务器...');
+    for (const stunUrl of stunServers) {
+        try {
+            console.log(`📡 测试 ${stunUrl}...`);
+            const testResult = await testStunServer(stunUrl);
+            results.stun.push({
+                url: stunUrl,
+                success: testResult.success,
+                localAddress: testResult.localAddress,
+                serverAddress: testResult.serverAddress,
+                error: testResult.error
+            });
+            
+            if (testResult.success) {
+                results.summary.stunWorking++;
+                console.log(`✅ ${stunUrl} 工作正常`);
+            } else {
+                results.summary.stunFailed++;
+                console.log(`❌ ${stunUrl} 连接失败:`, testResult.error);
+            }
+        } catch (error) {
+            results.stun.push({
+                url: stunUrl,
+                success: false,
+                error: error.message
+            });
+            results.summary.stunFailed++;
+            console.log(`❌ ${stunUrl} 测试异常:`, error.message);
+        }
+    }
+    
+    // 测试TURN服务器
+    const turnServers = [
+        {
+            urls: 'turn:openrelay.metered.ca:80',
+            username: 'openrelayproject',
+            credential: 'openrelayproject'
+        },
+        {
+            urls: 'turn:numb.viagenie.ca:3478',
+            username: 'webrtc@live.com',
+            credential: 'muazkh'
+        }
+    ];
+    
+    console.log('🧪 测试TURN服务器...');
+    for (const turnServer of turnServers) {
+        try {
+            console.log(`📡 测试 ${turnServer.urls}...`);
+            const testResult = await testTurnServer(turnServer);
+            results.turn.push({
+                url: turnServer.urls,
+                username: turnServer.username,
+                success: testResult.success,
+                candidates: testResult.candidates,
+                error: testResult.error
+            });
+            
+            if (testResult.success) {
+                results.summary.turnWorking++;
+                console.log(`✅ ${turnServer.urls} 工作正常`);
+            } else {
+                results.summary.turnFailed++;
+                console.log(`❌ ${turnServer.urls} 连接失败:`, testResult.error);
+            }
+        } catch (error) {
+            results.turn.push({
+                url: turnServer.urls,
+                username: turnServer.username,
+                success: false,
+                error: error.message
+            });
+            results.summary.turnFailed++;
+            console.log(`❌ ${turnServer.urls} 测试异常:`, error.message);
+        }
+    }
+    
+    // 输出诊断报告
+    console.log('📊 ===== 网络连接诊断报告 =====');
+    console.log('📈 STUN服务器:', `${results.summary.stunWorking}/${results.summary.stunWorking + results.summary.stunFailed} 可用`);
+    console.log('📈 TURN服务器:', `${results.summary.turnWorking}/${results.summary.turnWorking + results.summary.turnFailed} 可用`);
+    
+    if (results.summary.stunWorking === 0) {
+        console.error('🚨 所有STUN服务器都无法连接! 这可能导致WebRTC连接问题');
+    }
+    
+    if (results.summary.turnWorking === 0) {
+        console.error('🚨 所有TURN服务器都无法连接! 不同网络下的通话可能无法建立');
+    }
+    
+    console.log('📊 详细结果:', results);
+    console.log('🔍 ===== 网络连接诊断完成 =====');
+    
+    return results;
+};
+
+// 测试单个STUN服务器
+async function testStunServer(stunUrl) {
+    return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+            reject(new Error('测试超时'));
+        }, 10000);
+        
+        const pc = new RTCPeerConnection({
+            iceServers: [{ urls: stunUrl }]
+        });
+        
+        let resolved = false;
+        
+        pc.onicecandidate = (event) => {
+            if (event.candidate && !resolved) {
+                resolved = true;
+                clearTimeout(timeout);
+                
+                const candidate = event.candidate;
+                resolve({
+                    success: true,
+                    localAddress: candidate.address,
+                    serverAddress: candidate.relatedAddress,
+                    type: candidate.type
+                });
+                
+                pc.close();
+            }
+        };
+        
+        pc.onicegatheringstatechange = () => {
+            if (pc.iceGatheringState === 'complete' && !resolved) {
+                resolved = true;
+                clearTimeout(timeout);
+                resolve({
+                    success: false,
+                    error: '未收到STUN响应'
+                });
+                pc.close();
+            }
+        };
+        
+        // 创建一个数据通道触发ICE收集
+        pc.createDataChannel('test');
+        pc.createOffer().then(offer => pc.setLocalDescription(offer));
+    });
+}
+
+// 测试单个TURN服务器
+async function testTurnServer(turnServer) {
+    return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+            resolve({
+                success: false,
+                error: '测试超时',
+                candidates: []
+            });
+        }, 15000);
+        
+        const pc = new RTCPeerConnection({
+            iceServers: [turnServer],
+            iceCandidatePoolSize: 1
+        });
+        
+        const candidates = [];
+        let hasRelayCandidates = false;
+        
+        pc.onicecandidate = (event) => {
+            if (event.candidate) {
+                candidates.push({
+                    type: event.candidate.type,
+                    protocol: event.candidate.protocol,
+                    address: event.candidate.address
+                });
+                
+                if (event.candidate.type === 'relay') {
+                    hasRelayCandidates = true;
+                }
+            }
+        };
+        
+        pc.onicegatheringstatechange = () => {
+            if (pc.iceGatheringState === 'complete') {
+                clearTimeout(timeout);
+                resolve({
+                    success: hasRelayCandidates,
+                    error: hasRelayCandidates ? null : '未获取到relay候选',
+                    candidates: candidates
+                });
+                pc.close();
+            }
+        };
+        
+        // 创建一个数据通道触发ICE收集
+        pc.createDataChannel('test');
+        pc.createOffer().then(offer => pc.setLocalDescription(offer));
+    });
+}
 
 // 暴露手动播放音频的函数，用于解决移动端自动播放限制
 window.forcePlayRemoteAudio = function() {
