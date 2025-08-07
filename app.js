@@ -860,12 +860,11 @@ async function testMicrophonePermission() {
         
         // 尝试获取麦克风权限（不保存流）
         console.log('正在请求麦克风权限...');
+        const audioConstraints = getOptimizedAudioConstraints();
+        console.log('🎙️ 测试音频约束配置:', audioConstraints);
+        
         const testStream = await navigator.mediaDevices.getUserMedia({ 
-            audio: {
-                echoCancellation: true,
-                noiseSuppression: true,
-                autoGainControl: true
-            }
+            audio: audioConstraints
         });
         
         // 立即停止测试流
@@ -967,12 +966,11 @@ async function startVoiceCall() {
         
         // 获取麦克风权限
         console.log('正在请求麦克风权限...');
+        const audioConstraints = getOptimizedAudioConstraints();
+        console.log('🎙️ 使用音频约束配置:', audioConstraints);
+        
         localStream = await navigator.mediaDevices.getUserMedia({
-            audio: {
-                echoCancellation: true,
-                noiseSuppression: true,
-                autoGainControl: true
-            }
+            audio: audioConstraints
         });
         
         console.log('✅ 麦克风权限获取成功');
@@ -1078,9 +1076,18 @@ function cleanupCallResources() {
         localStream = null;
     }
     
-    // 关闭所有对等连接
+    // 关闭所有对等连接并清理音频元素
     peerConnections.forEach((connection, userId) => {
         connection.close();
+        
+        // 清理对应的远程音频元素
+        const audioElement = document.getElementById(`remote-audio-${userId}`);
+        if (audioElement) {
+            console.log('🧹 清理远程音频元素:', userId);
+            audioElement.pause();
+            audioElement.srcObject = null;
+            audioElement.remove();
+        }
     });
     peerConnections.clear();
     remoteStreams.clear();
@@ -1143,12 +1150,11 @@ async function acceptCall() {
         
         // 获取麦克风权限
         console.log('正在请求麦克风权限...');
+        const audioConstraints = getOptimizedAudioConstraints();
+        console.log('🎙️ 使用音频约束配置:', audioConstraints);
+        
         localStream = await navigator.mediaDevices.getUserMedia({
-            audio: {
-                echoCancellation: true,
-                noiseSuppression: true,
-                autoGainControl: true
-            }
+            audio: audioConstraints
         });
         
         console.log('✅ 麦克风权限获取成功');
@@ -1484,16 +1490,124 @@ function stopCallTimer() {
     }
 }
 
+// 检测设备类型
+function detectDeviceType() {
+    const userAgent = navigator.userAgent || navigator.vendor || window.opera;
+    
+    // 检测移动设备
+    const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(userAgent);
+    
+    // 检测iOS
+    const isIOS = /iPad|iPhone|iPod/.test(userAgent);
+    
+    // 检测Android
+    const isAndroid = /Android/i.test(userAgent);
+    
+    return {
+        isMobile,
+        isIOS,
+        isAndroid,
+        isDesktop: !isMobile
+    };
+}
+
+// 获取优化的音频约束
+function getOptimizedAudioConstraints() {
+    const device = detectDeviceType();
+    
+    if (device.isMobile) {
+        console.log('📱 移动设备 - 使用强化的音频处理配置');
+        return {
+            echoCancellation: { exact: true },
+            noiseSuppression: { exact: true },
+            autoGainControl: { exact: true },
+            googEchoCancellation: true,
+            googAutoGainControl: true,
+            googNoiseSuppression: true,
+            googHighpassFilter: true,
+            googTypingNoiseDetection: true,
+            googAudioMirroring: false,
+            sampleRate: { ideal: 48000 },
+            channelCount: { exact: 1 }
+        };
+    } else {
+        console.log('💻 桌面设备 - 使用标准音频处理配置');
+        return {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+            googEchoCancellation: true,
+            googAutoGainControl: true,
+            googNoiseSuppression: true,
+            sampleRate: { ideal: 48000 },
+            channelCount: { exact: 1 }
+        };
+    }
+}
+
 // WebRTC连接处理
 function createPeerConnection(userId) {
     const configuration = {
         iceServers: [
+            // Google公共STUN服务器
             { urls: 'stun:stun.l.google.com:19302' },
-            { urls: 'stun:stun1.l.google.com:19302' }
-        ]
+            { urls: 'stun:stun1.l.google.com:19302' },
+            { urls: 'stun:stun2.l.google.com:19302' },
+            { urls: 'stun:stun3.l.google.com:19302' },
+            { urls: 'stun:stun4.l.google.com:19302' },
+            
+            // 其他公共STUN服务器
+            { urls: 'stun:stunserver.org' },
+            { urls: 'stun:stun.voiparound.com' },
+            { urls: 'stun:stun.voipbuster.com' },
+            
+            // 免费TURN服务器 (用于NAT穿透)
+            {
+                urls: 'turn:openrelay.metered.ca:80',
+                username: 'openrelayproject',
+                credential: 'openrelayproject'
+            },
+            {
+                urls: 'turn:openrelay.metered.ca:443',
+                username: 'openrelayproject',
+                credential: 'openrelayproject'
+            },
+            {
+                urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+                username: 'openrelayproject',
+                credential: 'openrelayproject'
+            }
+        ],
+        iceCandidatePoolSize: 10,
+        bundlePolicy: 'max-bundle',
+        rtcpMuxPolicy: 'require'
     };
     
     const peerConnection = new RTCPeerConnection(configuration);
+    
+    // 添加连接状态监控
+    peerConnection.oniceconnectionstatechange = () => {
+        console.log('🔗 ICE连接状态变化:', peerConnection.iceConnectionState);
+        
+        switch (peerConnection.iceConnectionState) {
+            case 'connected':
+            case 'completed':
+                console.log('✅ WebRTC连接建立成功');
+                break;
+            case 'disconnected':
+                console.warn('⚠️ WebRTC连接断开');
+                break;
+            case 'failed':
+                console.error('❌ WebRTC连接失败');
+                // 可以尝试重新连接
+                handleConnectionFailure(userId);
+                break;
+        }
+    };
+    
+    peerConnection.onconnectionstatechange = () => {
+        console.log('🔗 连接状态变化:', peerConnection.connectionState);
+    };
     
     // 添加本地流
     if (localStream) {
@@ -1503,17 +1617,34 @@ function createPeerConnection(userId) {
         });
     }
     
-    // 处理远程流
+    // 处理远程流 - 改进回声处理
     peerConnection.ontrack = (event) => {
         console.log('📞 收到远程音频流:', userId, event.streams[0].getTracks());
         remoteStreams.set(userId, event.streams[0]);
         
-        // 播放远程音频
+        // 创建音频播放元素，添加回声预防措施
         const audioElement = document.createElement('audio');
         audioElement.srcObject = event.streams[0];
         audioElement.autoplay = true;
         audioElement.muted = !isSpeakerOn;
-        audioElement.volume = 1.0;
+        
+        // 移动设备特殊配置
+        const device = detectDeviceType();
+        if (device.isMobile) {
+            console.log('📱 移动设备 - 应用回声预防配置');
+            audioElement.volume = 0.8; // 稍微降低音量防止回声
+            audioElement.setAttribute('playsinline', true);
+            audioElement.setAttribute('webkit-playsinline', true);
+            
+            // iOS特殊处理
+            if (device.isIOS) {
+                audioElement.setAttribute('muted', false);
+                audioElement.setAttribute('controls', false);
+                audioElement.style.display = 'none';
+            }
+        } else {
+            audioElement.volume = 1.0;
+        }
         
         // 添加音频事件监听
         audioElement.onloadedmetadata = () => {
@@ -1527,6 +1658,10 @@ function createPeerConnection(userId) {
         audioElement.onerror = (error) => {
             console.error('📞 远程音频播放错误:', error);
         };
+        
+        // 设置音频元素ID以便管理
+        audioElement.id = `remote-audio-${userId}`;
+        audioElement.setAttribute('data-user-id', userId);
         
         document.body.appendChild(audioElement);
     };
@@ -1547,6 +1682,32 @@ function createPeerConnection(userId) {
     
     peerConnections.set(userId, peerConnection);
     return peerConnection;
+}
+
+// 处理连接失败
+function handleConnectionFailure(userId) {
+    console.log('🔄 尝试重新建立连接:', userId);
+    
+    const peerConnection = peerConnections.get(userId);
+    if (peerConnection) {
+        // 关闭失败的连接
+        peerConnection.close();
+        peerConnections.delete(userId);
+        
+        // 移除对应的音频元素
+        const audioElement = document.getElementById(`remote-audio-${userId}`);
+        if (audioElement) {
+            audioElement.remove();
+        }
+        
+        // 短暂延迟后尝试重新连接
+        setTimeout(() => {
+            if (isInCall && callParticipants.has(userId)) {
+                console.log('🔄 重新创建WebRTC连接:', userId);
+                createPeerConnection(userId);
+            }
+        }, 2000);
+    }
 }
 
 // 处理通话邀请
@@ -5048,6 +5209,47 @@ function validateMicrophoneState() {
     }
 }
 
+// 调试WebRTC连接状态
+function debugWebRTCConnections() {
+    console.log('🔍 WebRTC连接调试信息:');
+    console.log('通话状态:', isInCall);
+    console.log('参与者数量:', callParticipants.size);
+    console.log('对等连接数量:', peerConnections.size);
+    console.log('远程流数量:', remoteStreams.size);
+    
+    if (localStream) {
+        const audioTracks = localStream.getAudioTracks();
+        console.log('本地音频轨道:', audioTracks.length, audioTracks.map(t => ({
+            enabled: t.enabled,
+            readyState: t.readyState,
+            label: t.label
+        })));
+    }
+    
+    peerConnections.forEach((pc, userId) => {
+        console.log(`用户 ${userId} 连接状态:`, {
+            iceConnectionState: pc.iceConnectionState,
+            connectionState: pc.connectionState,
+            signalingState: pc.signalingState
+        });
+    });
+    
+    // 检查远程音频元素
+    const audioElements = document.querySelectorAll('audio[data-user-id]');
+    console.log('远程音频元素:', audioElements.length);
+    audioElements.forEach(audio => {
+        console.log(`音频元素 ${audio.getAttribute('data-user-id')}:`, {
+            paused: audio.paused,
+            volume: audio.volume,
+            muted: audio.muted,
+            readyState: audio.readyState
+        });
+    });
+}
+
+// 将调试函数暴露到全局，方便开发者调用
+window.debugWebRTC = debugWebRTCConnections;
+
 // ==================== 转录面板控制函数 ====================
 
 // 转录面板现在固定显示，此函数用于兼容性
@@ -5120,12 +5322,11 @@ async function testMicrophone() {
         
         // 尝试获取麦克风权限（不保存流）
         console.log('正在测试麦克风权限...');
+        const audioConstraints = getOptimizedAudioConstraints();
+        console.log('🎙️ 测试音频约束配置:', audioConstraints);
+        
         const testStream = await navigator.mediaDevices.getUserMedia({ 
-            audio: {
-                echoCancellation: true,
-                noiseSuppression: true,
-                autoGainControl: true
-            }
+            audio: audioConstraints
         });
         
         // 立即停止测试流
