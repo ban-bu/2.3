@@ -1047,11 +1047,11 @@ async function startVoiceCall() {
         if (isRealtimeEnabled && window.realtimeClient) {
             if (window.realtimeClient.socket && window.realtimeClient.socket.connected) {
                 console.log('✅ WebSocket连接正常，发送通话邀请...');
-                window.realtimeClient.sendCallInvite({
-                    roomId,
-                    callerId: currentUserId,
-                    callerName: currentUsername
-                });
+            window.realtimeClient.sendCallInvite({
+                roomId,
+                callerId: currentUserId,
+                callerName: currentUsername
+            });
                 console.log('📤 通话邀请已发送');
             } else {
                 console.error('❌ WebSocket未连接! 自动尝试修复...');
@@ -1592,8 +1592,43 @@ function getOptimizedAudioConstraints() {
     }
 }
 
-// WebRTC连接处理
-function createPeerConnection(userId) {
+// 检测网络是否不稳定
+function isNetworkUnstable() {
+    // 检测是否存在失败的连接
+    let hasFailedConnections = false;
+    peerConnections.forEach((pc, userId) => {
+        if (pc.iceConnectionState === 'failed' || 
+            pc.iceConnectionState === 'disconnected' ||
+            (pc.iceConnectionState === 'new' && pc.signalingState === 'have-local-offer')) {
+            hasFailedConnections = true;
+        }
+    });
+    
+    // 如果有失败的连接，认为网络不稳定
+    if (hasFailedConnections) {
+        console.log('🚨 检测到网络不稳定：存在失败连接');
+        return true;
+    }
+    
+    // 检测WebSocket连接质量
+    if (window.realtimeClient && window.realtimeClient.socket) {
+        const socket = window.realtimeClient.socket;
+        if (!socket.connected || (socket.ping && socket.ping > 1000)) {
+            console.log('🚨 检测到网络不稳定：WebSocket连接差');
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+// WebRTC连接处理 - 智能选择连接配置
+function createPeerConnection(userId, enhanced = false) {
+    // 🚀 检测到网络不稳定或明确要求时，直接使用增强模式
+    if (enhanced || isNetworkUnstable()) {
+        console.log('🚀 网络不稳定或明确要求，使用增强连接配置...');
+        return createEnhancedPeerConnection(userId);
+    }
     const configuration = {
         iceServers: [
             // Google公共STUN服务器
@@ -1716,50 +1751,103 @@ function createPeerConnection(userId) {
     // 保存超时器引用
     peerConnection._connectionTimeout = connectionTimeout;
     
-    // 添加连接状态监控
+    // 添加连接状态监控 - 增强版
+    let iceRestartCount = 0;
+    const maxIceRestarts = 3;
+    let lastConnectionTime = Date.now();
+    
     peerConnection.oniceconnectionstatechange = () => {
-        console.log('🔗 ICE连接状态变化:', peerConnection.iceConnectionState, '用户:', userId);
+        const currentTime = Date.now();
+        const timeSinceLastChange = currentTime - lastConnectionTime;
+        lastConnectionTime = currentTime;
+        
+        console.log('🔗 ICE连接状态变化:', peerConnection.iceConnectionState, '用户:', userId, 
+                   `(距上次变化: ${timeSinceLastChange}ms)`);
         
         switch (peerConnection.iceConnectionState) {
+            case 'new':
+                console.log('🆕 ICE连接初始化中...');
+                // 如果在"new"状态停留过久，尝试收集更多ICE候选
+                setTimeout(() => {
+                    if (peerConnection.iceConnectionState === 'new') {
+                        console.warn('⚠️ ICE连接停留在new状态过久，可能存在网络问题');
+                        // 记录网络状态以便诊断
+                        console.log('🔍 网络诊断:', {
+                            iceGatheringState: peerConnection.iceGatheringState,
+                            signalingState: peerConnection.signalingState,
+                            connectionState: peerConnection.connectionState
+                        });
+                    }
+                }, 8000); // 8秒后检查
+                break;
+                
             case 'checking':
                 console.log('🔍 ICE连接检查中...');
                 break;
+                
             case 'connected':
             case 'completed':
                 console.log('✅ WebRTC连接建立成功! 用户:', userId);
+                iceRestartCount = 0; // 重置重启计数
+                showToast(`与用户 ${userId} 的连接已建立`, 'success');
+                
                 // 清除超时器
                 if (peerConnection._connectionTimeout) {
                     clearTimeout(peerConnection._connectionTimeout);
                     peerConnection._connectionTimeout = null;
                 }
                 break;
+                
             case 'disconnected':
                 console.warn('⚠️ WebRTC连接断开, 用户:', userId);
-                // 启动重连计时器
+                showToast(`与用户 ${userId} 的连接暂时中断`, 'warning');
+                
+                // 智能重连策略 - 基于断开时长调整
+                const reconnectDelay = Math.min(5000 + (iceRestartCount * 2000), 15000);
                 setTimeout(() => {
                     if (peerConnection.iceConnectionState === 'disconnected') {
-                        console.log('🔄 连接断开过久，尝试重连...');
-                        handleConnectionFailure(userId);
+                        console.log(`🔄 连接断开${reconnectDelay/1000}秒，尝试ICE重启...`);
+                        if (iceRestartCount < maxIceRestarts) {
+                            performIceRestart(peerConnection, userId);
+                            iceRestartCount++;
+                        } else {
+                            console.error('❌ ICE重启次数已达上限，尝试完全重连...');
+                            handleConnectionFailure(userId);
+                        }
                     }
-                }, 10000);
+                }, reconnectDelay);
                 break;
+                
             case 'failed':
                 console.error('❌ WebRTC连接失败, 用户:', userId);
+                showToast(`与用户 ${userId} 的连接失败`, 'error');
+                
                 // 清除超时器
                 if (peerConnection._connectionTimeout) {
                     clearTimeout(peerConnection._connectionTimeout);
                     peerConnection._connectionTimeout = null;
                 }
-                // 尝试重新连接
-                handleConnectionFailure(userId);
+                
+                // 根据失败原因选择恢复策略
+                if (iceRestartCount < maxIceRestarts && 
+                    peerConnection.signalingState === 'stable') {
+                    console.log('🔄 尝试ICE重启恢复连接...');
+                    performIceRestart(peerConnection, userId);
+                    iceRestartCount++;
+                } else {
+                    console.log('🔄 ICE重启无效，执行完全重连...');
+                    handleConnectionFailure(userId);
+                }
                 break;
+                
             case 'closed':
                 console.log('🔒 WebRTC连接已关闭, 用户:', userId);
-                // 清除超时器
+                // 清除超时器和重启计数
                 if (peerConnection._connectionTimeout) {
                     clearTimeout(peerConnection._connectionTimeout);
                     peerConnection._connectionTimeout = null;
                 }
+                iceRestartCount = 0;
                 break;
         }
     };
@@ -1801,7 +1889,7 @@ function createPeerConnection(userId) {
         console.error('❌ 没有本地流可添加!');
     }
     
-    // 处理远程流 - 改进回声处理和增强日志
+        // 处理远程流 - 增强版流恢复机制
     peerConnection.ontrack = (event) => {
         console.log('📡 ===== 收到远程音频流 =====');
         console.log('👤 用户ID:', userId);
@@ -1831,63 +1919,58 @@ function createPeerConnection(userId) {
                 }))
             });
             
+            // 检查是否已存在该用户的流，如果存在则先清理
+            if (remoteStreams.has(userId)) {
+                console.log('🧹 检测到用户已有远程流，先清理旧流...');
+                const oldStream = remoteStreams.get(userId);
+                if (oldStream) {
+                    oldStream.getTracks().forEach(track => {
+                        track.stop();
+                        console.log('🛑 停止旧音频轨道:', track.id);
+                    });
+                }
+                
+                // 清理旧的音频元素
+                const oldAudioElement = document.getElementById(`remote-audio-${userId}`);
+                if (oldAudioElement) {
+                    oldAudioElement.pause();
+                    oldAudioElement.srcObject = null;
+                    oldAudioElement.remove();
+                    console.log('🗑️ 移除旧音频元素');
+                }
+            }
+            
             remoteStreams.set(userId, stream);
             console.log('✅ 远程流已保存到Map, 当前远程流数量:', remoteStreams.size);
             
-            // 创建音频播放元素，添加回声预防措施
-            const audioElement = document.createElement('audio');
-            console.log('🔊 开始创建音频播放元素...');
-            
-            // 设置基本属性
-            audioElement.srcObject = stream;
-            audioElement.autoplay = true;
-            audioElement.controls = false; // 隐藏控件
-            audioElement.muted = !isSpeakerOn;
-            
-            // 移动设备特殊配置
-            const device = detectDeviceType();
-            if (device.isMobile) {
-                console.log('📱 移动设备 - 应用回声预防配置');
-                audioElement.volume = 0.8; // 稍微降低音量防止回声
-                audioElement.setAttribute('playsinline', true);
-                audioElement.setAttribute('webkit-playsinline', true);
+            // 添加流状态监控
+            stream.getAudioTracks().forEach(track => {
+                track.onended = () => {
+                    console.warn('⚠️ 远程音频轨道结束:', track.id, '用户:', userId);
+                    // 尝试自动恢复流
+                    setTimeout(() => {
+                        if (!remoteStreams.has(userId) || 
+                            remoteStreams.get(userId).getAudioTracks().length === 0) {
+                            console.log('🔄 检测到流丢失，尝试自动恢复...');
+                            autoRecoverStream(userId);
+                        }
+                    }, 2000); // 2秒后检查是否需要恢复
+                };
                 
-                // iOS特殊处理
-                if (device.isIOS) {
-                    audioElement.setAttribute('muted', false);
-                    audioElement.setAttribute('controls', false);
-                    audioElement.style.display = 'none';
-                    console.log('🍎 iOS设备特殊配置已应用');
-                }
-            } else {
-                audioElement.volume = 1.0;
-                console.log('💻 桌面设备配置已应用');
-            }
+                track.onmute = () => {
+                    console.warn('🔇 远程音频轨道被静音:', track.id, '用户:', userId);
+                };
+                
+                track.onunmute = () => {
+                    console.log('🔊 远程音频轨道取消静音:', track.id, '用户:', userId);
+                };
+            });
             
-            // 添加详细的音频事件监听
-            audioElement.onloadstart = () => {
-                console.log('🎵 音频开始加载 - 用户:', userId);
-            };
+            // 创建增强的音频播放元素
+            const audioElement = createEnhancedAudioElement(userId, stream);
+            console.log('✅ 增强音频播放元素创建完成');
             
-            audioElement.onloadedmetadata = () => {
-                console.log('✅ 远程音频元数据加载完成 - 用户:', userId, {
-                    duration: audioElement.duration,
-                    networkState: audioElement.networkState,
-                    readyState: audioElement.readyState
-                });
-            };
-            
-            audioElement.oncanplay = () => {
-                console.log('✅ 远程音频可以播放 - 用户:', userId);
-            };
-            
-            audioElement.onplay = () => {
-                console.log('🎉 远程音频开始播放 - 用户:', userId, {
-                    currentTime: audioElement.currentTime,
-                    volume: audioElement.volume,
-                    muted: audioElement.muted
-                });
-            };
+            showToast(`收到用户 ${userId} 的音频流`, 'success');
             
             audioElement.onpause = () => {
                 console.log('⏸️ 远程音频暂停 - 用户:', userId);
@@ -1895,9 +1978,9 @@ function createPeerConnection(userId) {
             
             audioElement.onended = () => {
                 console.log('🏁 远程音频结束 - 用户:', userId);
-            };
-            
-            audioElement.onerror = (error) => {
+        };
+        
+        audioElement.onerror = (error) => {
                 console.error('❌ 远程音频播放错误 - 用户:', userId, {
                     error: error,
                     code: audioElement.error ? audioElement.error.code : '未知',
@@ -1924,7 +2007,7 @@ function createPeerConnection(userId) {
             console.log('📝 音频元素ID设置:', audioElement.id);
             
             // 添加到DOM
-            document.body.appendChild(audioElement);
+        document.body.appendChild(audioElement);
             console.log('✅ 音频元素已添加到DOM');
             
             // 验证添加是否成功
@@ -2162,7 +2245,7 @@ async function handleCallAccept(data) {
     
     // 🔥 关键修复：创建WebRTC连接并开始协商
     console.log('🔗 为接受用户创建WebRTC连接...');
-    const peerConnection = createPeerConnection(data.userId);
+    const peerConnection = createPeerConnection(data.userId, true); // 🚀 使用增强模式
     
     // 确定谁应该发起offer（使用用户ID排序避免双向offer）
     const shouldInitiateOffer = currentUserId < data.userId;
@@ -2171,7 +2254,7 @@ async function handleCallAccept(data) {
         console.log('📤 我方发起WebRTC Offer给用户:', data.userId);
         
         try {
-            // 创建并发送offer
+    // 创建并发送offer
             const offer = await peerConnection.createOffer({
                 offerToReceiveAudio: true,
                 offerToReceiveVideo: false
@@ -2282,7 +2365,7 @@ async function handleCallOffer(data) {
     });
     
     console.log('🔗 创建对等连接...');
-    const peerConnection = createPeerConnection(data.fromUserId);
+    const peerConnection = createPeerConnection(data.fromUserId, true); // 🚀 使用增强模式
     
     try {
         console.log('📝 设置远程描述...');
@@ -5990,7 +6073,7 @@ async function autoAttemptConnectionRepair(userId) {
         
         // 重新创建连接
         console.log('🔗 重新创建WebRTC连接...');
-        const peerConnection = createPeerConnection(userId);
+        const peerConnection = createPeerConnection(userId, true); // 🚀 使用增强模式
         
         // 创建并发送新的offer
         console.log('📤 创建新的Offer...');
@@ -6025,6 +6108,505 @@ async function autoAttemptConnectionRepair(userId) {
     }
     
     console.log('🔧 ===== 自动连接修复完成 =====');
+}
+
+// 智能连接修复 - 基于网络质量的自适应修复策略
+async function performIntelligentConnectionRepair(networkQuality = null) {
+    console.log('🚀 ===== 智能连接修复开始 =====');
+    
+    if (!isInCall) {
+        console.log('⚠️ 通话已结束，跳过修复');
+        return;
+    }
+    
+    // 如果没有提供网络质量信息，先检测
+    if (!networkQuality) {
+        networkQuality = await detectNetworkQuality();
+    }
+    
+    console.log('📊 网络质量评估:', networkQuality);
+    
+    // 根据网络质量选择修复策略
+    let repairStrategy = 'conservative'; // 默认保守策略
+    if (networkQuality.score > 70) {
+        repairStrategy = 'aggressive'; // 网络好时使用激进策略
+    } else if (networkQuality.score > 40) {
+        repairStrategy = 'moderate'; // 中等网络使用适中策略
+    }
+    
+    console.log('🔧 选择修复策略:', repairStrategy);
+    
+    // 分析所有问题连接
+    const problemConnections = [];
+    peerConnections.forEach((pc, userId) => {
+        if (pc.iceConnectionState === 'new' || 
+            pc.iceConnectionState === 'checking' ||
+            pc.signalingState === 'have-local-offer' ||
+            !remoteStreams.has(userId)) {
+            problemConnections.push(userId);
+        }
+    });
+    
+    if (problemConnections.length === 0) {
+        console.log('✅ 没有发现问题连接');
+        return;
+    }
+    
+    console.log('🔍 发现问题连接:', problemConnections);
+    showToast(`检测到 ${problemConnections.length} 个连接问题，正在智能修复...`, 'warning');
+    
+    // 🚀 策略1: 强制信令重试
+    console.log('🔄 策略1: 强制信令重试...');
+    await forceSignalingRetry(problemConnections);
+    
+    // 等待2秒检查是否有改善
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    
+    // 检查修复效果
+    const stillProblem = [];
+    problemConnections.forEach(userId => {
+        const pc = peerConnections.get(userId);
+        if (pc && (pc.iceConnectionState === 'new' || !remoteStreams.has(userId))) {
+            stillProblem.push(userId);
+        }
+    });
+    
+    if (stillProblem.length > 0) {
+        console.log('⚠️ 信令重试后仍有问题，执行策略2...');
+        
+        // 🚀 策略2: 激进重建连接
+        console.log('🔄 策略2: 激进重建连接...');
+        await aggressiveConnectionRebuild(stillProblem);
+        
+        // 再等待3秒检查
+        await new Promise(resolve => setTimeout(resolve, 3000));
+        
+        // 最终检查
+        const finalCheck = [];
+        stillProblem.forEach(userId => {
+            const pc = peerConnections.get(userId);
+            if (pc && (pc.iceConnectionState === 'new' || !remoteStreams.has(userId))) {
+                finalCheck.push(userId);
+            }
+        });
+        
+        if (finalCheck.length > 0) {
+            console.error('❌ 智能修复失败，可能是网络环境过于复杂');
+            showToast('网络环境复杂，建议检查防火墙设置或更换网络', 'error');
+            
+            // 🚀 策略3: 最后的备用方案
+            console.log('🔄 策略3: 备用连接方案...');
+            await implementFallbackStrategy(finalCheck);
+        } else {
+            console.log('✅ 激进重建成功!');
+            showToast('连接已成功修复', 'success');
+        }
+    } else {
+        console.log('✅ 信令重试成功!');
+        showToast('连接已通过信令重试修复', 'success');
+    }
+    
+    console.log('🚀 ===== 智能连接修复完成 =====');
+}
+
+// 强制信令重试
+async function forceSignalingRetry(userIds) {
+    console.log('📡 ===== 强制信令重试 =====');
+    
+    for (const userId of userIds) {
+        console.log(`🔄 重试用户 ${userId} 的信令协商...`);
+        
+        const pc = peerConnections.get(userId);
+        if (!pc) continue;
+        
+        try {
+            // 如果是offer方，重新发送offer
+            if (currentUserId < userId) {
+                console.log(`📤 重新发送Offer给 ${userId}...`);
+                
+                const offer = await pc.createOffer({
+                    offerToReceiveAudio: true,
+                    offerToReceiveVideo: false,
+                    iceRestart: true // 强制ICE重启
+                });
+                
+                await pc.setLocalDescription(offer);
+                
+                if (window.realtimeClient && window.realtimeClient.socket && window.realtimeClient.socket.connected) {
+                    // 重试发送3次，确保可靠性
+                    for (let attempt = 1; attempt <= 3; attempt++) {
+                        console.log(`📤 发送Offer尝试 ${attempt}/3 给 ${userId}`);
+                        
+                        window.realtimeClient.sendCallOffer({
+                            roomId,
+                            targetUserId: userId,
+                            offer: pc.localDescription,
+                            fromUserId: currentUserId,
+                            retry: true,
+                            attempt: attempt
+                        });
+                        
+                        if (attempt < 3) {
+                            await new Promise(resolve => setTimeout(resolve, 1000));
+                        }
+                    }
+                } else {
+                    console.error('❌ WebSocket未连接，无法重试信令');
+                }
+            }
+        } catch (error) {
+            console.error(`❌ 用户 ${userId} 信令重试失败:`, error);
+        }
+    }
+    
+    console.log('📡 ===== 强制信令重试完成 =====');
+}
+
+// 激进重建连接
+async function aggressiveConnectionRebuild(userIds) {
+    console.log('💥 ===== 激进重建连接 =====');
+    
+    for (const userId of userIds) {
+        console.log(`💥 激进重建用户 ${userId} 的连接...`);
+        
+        try {
+            // 1. 完全清理旧连接
+            if (peerConnections.has(userId)) {
+                const oldPc = peerConnections.get(userId);
+                oldPc.close();
+                peerConnections.delete(userId);
+                console.log(`🗑️ 已清理用户 ${userId} 的旧连接`);
+            }
+            
+            if (remoteStreams.has(userId)) {
+                remoteStreams.delete(userId);
+            }
+            
+            const audioElement = document.getElementById(`remote-audio-${userId}`);
+            if (audioElement) {
+                audioElement.remove();
+                console.log(`🗑️ 已移除用户 ${userId} 的音频元素`);
+            }
+            
+            // 2. 使用增强配置重新创建连接
+            console.log(`🔗 使用增强配置重建用户 ${userId} 的连接...`);
+            const newPc = createEnhancedPeerConnection(userId);
+            
+            // 3. 如果是offer方，立即创建offer
+            if (currentUserId < userId) {
+                const offer = await newPc.createOffer({
+                    offerToReceiveAudio: true,
+                    offerToReceiveVideo: false
+                });
+                
+                await newPc.setLocalDescription(offer);
+                
+                if (window.realtimeClient && window.realtimeClient.socket && window.realtimeClient.socket.connected) {
+                    console.log(`📤 发送激进重建Offer给 ${userId}`);
+                    window.realtimeClient.sendCallOffer({
+                        roomId,
+                        targetUserId: userId,
+                        offer: newPc.localDescription,
+                        fromUserId: currentUserId,
+                        aggressiveRebuild: true
+                    });
+                }
+            }
+            
+            console.log(`✅ 用户 ${userId} 连接激进重建完成`);
+            
+        } catch (error) {
+            console.error(`❌ 用户 ${userId} 激进重建失败:`, error);
+        }
+        
+        // 每个用户之间稍作停顿
+        await new Promise(resolve => setTimeout(resolve, 500));
+    }
+    
+    console.log('💥 ===== 激进重建连接完成 =====');
+}
+
+// 创建增强的WebRTC连接
+function createEnhancedPeerConnection(userId) {
+    console.log('🚀 创建增强WebRTC连接:', userId);
+    
+    // 增强的ICE服务器配置 - 更多服务器，更高成功率
+    const enhancedIceServers = [
+        // Google STUN服务器
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' },
+        { urls: 'stun:stun3.l.google.com:19302' },
+        { urls: 'stun:stun4.l.google.com:19302' },
+        
+        // 其他公共STUN服务器
+        { urls: 'stun:stunserver.org' },
+        { urls: 'stun:stun.voiparound.com' },
+        { urls: 'stun:stun.voipbuster.com' },
+        { urls: 'stun:stun.ekiga.net' },
+        
+        // 高可靠性TURN服务器
+        {
+            urls: ['turn:openrelay.metered.ca:80', 'turn:openrelay.metered.ca:443'],
+            username: 'openrelayproject',
+            credential: 'openrelayproject'
+        },
+        {
+            urls: ['turn:openrelay.metered.ca:80?transport=tcp', 'turn:openrelay.metered.ca:443?transport=tcp'],
+            username: 'openrelayproject',
+            credential: 'openrelayproject'
+        },
+        {
+            urls: ['turn:numb.viagenie.ca:3478', 'turn:numb.viagenie.ca:3479'],
+            username: 'webrtc@live.com',
+            credential: 'muazkh'
+        },
+        {
+            urls: 'turn:turn.bistri.com:80',
+            username: 'homeo',
+            credential: 'homeo'
+        },
+        {
+            urls: 'turn:turn.anyfirewall.com:443?transport=tcp',
+            username: 'webrtc',
+            credential: 'webrtc'
+        },
+        
+        // 备用TURN服务器
+        {
+            urls: ['turn:global.relay.metered.ca:80', 'turn:global.relay.metered.ca:443'],
+            username: 'bdb1e980-e364-4e60-b8dd-3d5ca4b39b90',
+            credential: '2HJBJOLBNNDl1hqw'
+        }
+    ];
+    
+    const enhancedConfig = {
+        iceServers: enhancedIceServers,
+        iceCandidatePoolSize: 20, // 增加候选池大小
+        iceTransportPolicy: 'all',
+        bundlePolicy: 'max-bundle',
+        rtcpMuxPolicy: 'require',
+        // 更激进的ICE配置
+        iceGatheringState: 'gathering'
+    };
+    
+    const peerConnection = new RTCPeerConnection(enhancedConfig);
+    
+    // 添加本地流
+    if (localStream) {
+        localStream.getTracks().forEach(track => {
+            peerConnection.addTrack(track, localStream);
+            console.log('🎵 增强连接添加本地轨道:', track.kind, track.enabled);
+        });
+    }
+    
+    // 增强的事件监听器
+    peerConnection.onicecandidate = (event) => {
+        if (event.candidate) {
+            console.log(`🧊 增强连接ICE候选 [${userId}]:`, {
+                type: event.candidate.type,
+                protocol: event.candidate.protocol,
+                address: event.candidate.address,
+                port: event.candidate.port,
+                priority: event.candidate.priority
+            });
+            
+            if (isRealtimeEnabled && window.realtimeClient) {
+                window.realtimeClient.sendIceCandidate({
+                    roomId,
+                    candidate: event.candidate,
+                    targetUserId: userId,
+                    fromUserId: currentUserId,
+                    enhanced: true
+                });
+            }
+        } else {
+            console.log(`✅ 增强连接ICE候选收集完成 [${userId}]`);
+        }
+    };
+    
+    // 更详细的连接状态监控
+    peerConnection.oniceconnectionstatechange = () => {
+        console.log(`🔗 增强连接ICE状态变化 [${userId}]:`, peerConnection.iceConnectionState);
+        
+        if (peerConnection.iceConnectionState === 'connected') {
+            console.log(`🎉 增强连接建立成功 [${userId}]!`);
+            showToast(`与 ${userId} 的连接已建立`, 'success');
+        } else if (peerConnection.iceConnectionState === 'failed') {
+            console.error(`❌ 增强连接失败 [${userId}]`);
+            setTimeout(() => {
+                console.log(`🔄 增强连接失败，5秒后重试 [${userId}]...`);
+                autoAttemptConnectionRepair(userId);
+            }, 5000);
+        }
+    };
+    
+    peerConnection.ontrack = (event) => {
+        console.log(`📡 增强连接接收到远程流 [${userId}]:`, event.streams[0]);
+        const remoteStream = event.streams[0];
+        remoteStreams.set(userId, remoteStream);
+        
+        // 创建增强的音频元素
+        createEnhancedAudioElement(userId, remoteStream);
+    };
+    
+    // 30秒超时检测
+    setTimeout(() => {
+        if (peerConnection.iceConnectionState === 'new' || peerConnection.iceConnectionState === 'checking') {
+            console.warn(`⏰ 增强连接30秒超时 [${userId}]，状态: ${peerConnection.iceConnectionState}`);
+            handleConnectionTimeout(userId, peerConnection);
+        }
+    }, 30000);
+    
+    peerConnections.set(userId, peerConnection);
+    console.log(`✅ 增强WebRTC连接创建完成 [${userId}]`);
+    
+    return peerConnection;
+}
+
+// 创建增强的音频元素
+function createEnhancedAudioElement(userId, remoteStream) {
+    // 移除旧的音频元素
+    const existingAudio = document.getElementById(`remote-audio-${userId}`);
+    if (existingAudio) {
+        existingAudio.remove();
+    }
+    
+    const audio = document.createElement('audio');
+    audio.id = `remote-audio-${userId}`;
+    audio.setAttribute('data-user-id', userId);
+    audio.srcObject = remoteStream;
+    audio.autoplay = true;
+    audio.volume = 0.9; // 稍微提高音量
+    
+    // 检测设备类型并应用优化
+    const deviceType = detectDeviceType();
+    if (deviceType.isMobile) {
+        audio.muted = false;
+        audio.playsInline = true;
+        audio.setAttribute('webkit-playsinline', 'true');
+        audio.setAttribute('playsinline', 'true');
+        
+        if (deviceType.isIOS) {
+            audio.volume = 0.8;
+            audio.controls = false;
+            audio.style.display = 'none';
+        }
+    }
+    
+    // 增强的事件监听
+    audio.addEventListener('loadstart', () => {
+        console.log(`🔊 增强音频开始加载 [${userId}]`);
+    });
+    
+    audio.addEventListener('canplay', () => {
+        console.log(`🔊 增强音频可以播放 [${userId}]`);
+        audio.play().catch(e => {
+            console.warn(`⚠️ 增强音频自动播放失败 [${userId}]:`, e);
+            // 移动设备可能需要用户交互
+            if (deviceType.isMobile) {
+                showToast('请点击屏幕启用音频播放', 'info');
+                document.addEventListener('click', function playAudio() {
+                    audio.play();
+                    document.removeEventListener('click', playAudio);
+                }, { once: true });
+            }
+        });
+    });
+    
+    audio.addEventListener('play', () => {
+        console.log(`🎵 增强音频开始播放 [${userId}]`);
+    });
+    
+    audio.addEventListener('error', (e) => {
+        console.error(`❌ 增强音频播放错误 [${userId}]:`, e.error);
+    });
+    
+    document.body.appendChild(audio);
+    console.log(`✅ 增强音频元素创建完成 [${userId}]`);
+}
+
+// 备用连接策略
+async function implementFallbackStrategy(userIds) {
+    console.log('🆘 ===== 实施备用连接策略 =====');
+    
+    // 策略：降级到最基础但最可靠的配置
+    const fallbackConfig = {
+        iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            {
+                urls: 'turn:openrelay.metered.ca:80',
+                username: 'openrelayproject',
+                credential: 'openrelayproject'
+            }
+        ],
+        iceCandidatePoolSize: 5,
+        iceTransportPolicy: 'all'
+    };
+    
+    for (const userId of userIds) {
+        console.log(`🆘 为用户 ${userId} 实施备用策略...`);
+        
+        try {
+            // 清理现有连接
+            if (peerConnections.has(userId)) {
+                peerConnections.get(userId).close();
+                peerConnections.delete(userId);
+            }
+            
+            // 使用最简单的配置重新创建
+            const fallbackPc = new RTCPeerConnection(fallbackConfig);
+            
+            if (localStream) {
+                localStream.getTracks().forEach(track => {
+                    fallbackPc.addTrack(track, localStream);
+                });
+            }
+            
+            fallbackPc.ontrack = (event) => {
+                console.log(`🆘 备用连接接收到流 [${userId}]`);
+                remoteStreams.set(userId, event.streams[0]);
+                createEnhancedAudioElement(userId, event.streams[0]);
+            };
+            
+            fallbackPc.onicecandidate = (event) => {
+                if (event.candidate && window.realtimeClient) {
+                    window.realtimeClient.sendIceCandidate({
+                        roomId,
+                        candidate: event.candidate,
+                        targetUserId: userId,
+                        fromUserId: currentUserId,
+                        fallback: true
+                    });
+                }
+            };
+            
+            peerConnections.set(userId, fallbackPc);
+            
+            // 如果是offer方，发送备用offer
+            if (currentUserId < userId) {
+                const offer = await fallbackPc.createOffer();
+                await fallbackPc.setLocalDescription(offer);
+                
+                if (window.realtimeClient && window.realtimeClient.socket && window.realtimeClient.socket.connected) {
+                    window.realtimeClient.sendCallOffer({
+                        roomId,
+                        targetUserId: userId,
+                        offer: fallbackPc.localDescription,
+                        fromUserId: currentUserId,
+                        fallback: true
+                    });
+                }
+            }
+            
+            console.log(`🆘 用户 ${userId} 备用策略完成`);
+            
+        } catch (error) {
+            console.error(`❌ 用户 ${userId} 备用策略失败:`, error);
+        }
+    }
+    
+    console.log('🆘 ===== 备用连接策略完成 =====');
 }
 
 // 手动触发WebRTC连接建立（用于调试）
@@ -6070,7 +6652,7 @@ window.forceWebRTCConnection = async function(targetUserId) {
     try {
         // 创建新的WebRTC连接
         console.log('🔗 创建新的WebRTC连接...');
-        const peerConnection = createPeerConnection(targetUserId);
+        const peerConnection = createPeerConnection(targetUserId, true); // 🚀 使用增强模式
         
         console.log('📤 创建并发送Offer...');
         const offer = await peerConnection.createOffer({
@@ -6486,10 +7068,27 @@ function startConnectionMonitoring() {
     
     console.log('🔍 启动WebRTC连接状态自动监控...');
     
+    // 动态调整监控频率
+    let monitoringInterval = 10000; // 默认10秒
+    let lastIssueTime = 0;
+    let consecutiveHealthyChecks = 0;
+    
     connectionMonitorInterval = setInterval(async () => {
         if (isInCall && peerConnections.size > 0) {
+            const currentTime = Date.now();
+            const timeSinceLastIssue = currentTime - lastIssueTime;
+            
+            // 根据网络状况动态调整监控频率
+            if (timeSinceLastIssue > 60000) { // 1分钟内没有问题
+                consecutiveHealthyChecks++;
+                if (consecutiveHealthyChecks > 5) {
+                    monitoringInterval = Math.min(monitoringInterval * 1.2, 30000); // 最大30秒
+                }
+            }
+            
             console.log('📊 ===== WebRTC连接状态报告 =====');
             console.log('⏰ 时间:', new Date().toLocaleTimeString());
+            console.log('🔍 监控间隔:', monitoringInterval/1000 + '秒');
             console.log('📞 通话状态:', isInCall);
             console.log('👥 参与者数量:', callParticipants.size);
             console.log('🔗 对等连接数量:', peerConnections.size);
@@ -6594,32 +7193,46 @@ function startConnectionMonitoring() {
                 }
             });
             
-            // 🔥 如果检测到连接问题，自动输出详细诊断
+            // 🔥 如果检测到连接问题，启动智能修复
             if (hasConnectionIssues) {
-                console.error('🚨 检测到连接问题，自动运行详细诊断...');
+                console.error('🚨 检测到连接问题，启动智能自动修复...');
+                lastIssueTime = currentTime; // 记录问题时间
+                consecutiveHealthyChecks = 0; // 重置健康检查计数
+                monitoringInterval = Math.max(monitoringInterval / 2, 3000); // 加快监控频率，最小3秒
+                
+                // 运行网络质量检测
+                const networkQuality = await detectNetworkQuality();
+                console.log('📊 当前网络质量:', networkQuality);
+                
+                // 根据网络质量调整修复策略
+                if (networkQuality.score < 30) {
+                    console.warn('⚠️ 网络质量较差，使用保守修复策略');
+                    monitoringInterval = Math.max(monitoringInterval, 8000); // 降低监控频率
+                }
+                
                 autoShowCompleteStatus();
                 
-                // 如果问题持续，尝试自动修复
+                // 🚀 智能修复策略
                 setTimeout(async () => {
-                    // 检查是否仍有问题
-                    let stillHasIssues = false;
-                    peerConnections.forEach((pc, userId) => {
-                        if (pc.iceConnectionState === 'new' && !remoteStreams.has(userId)) {
-                            stillHasIssues = true;
-                            console.log(`🔧 自动尝试修复用户 ${userId} 的连接...`);
-                            autoAttemptConnectionRepair(userId);
-                        }
-                    });
-                    
-                    if (stillHasIssues) {
-                        console.log('🔧 问题持续存在，已触发自动修复流程');
-                    }
-                }, 10000); // 10秒后检查是否需要修复
+                    await performIntelligentConnectionRepair(networkQuality);
+                }, networkQuality.score < 50 ? 5000 : 2000); // 网络差时延迟更长
+            } else {
+                // 没有问题时，可以逐渐放松监控频率
+                consecutiveHealthyChecks++;
+                if (consecutiveHealthyChecks > 3) {
+                    monitoringInterval = Math.min(monitoringInterval * 1.1, 15000); // 最大15秒
+                }
             }
             
             console.log('📊 ===== 监控报告结束 =====\n');
+            
+            // 动态更新监控间隔
+            if (connectionMonitorInterval) {
+                clearInterval(connectionMonitorInterval);
+                connectionMonitorInterval = setInterval(arguments.callee, monitoringInterval);
+            }
         }
-    }, 5000); // 每5秒输出一次状态
+    }, monitoringInterval); // 使用动态间隔
 }
 
 // 停止自动连接监控
@@ -6628,6 +7241,293 @@ function stopConnectionMonitoring() {
         clearInterval(connectionMonitorInterval);
         connectionMonitorInterval = null;
         console.log('🛑 停止WebRTC连接状态监控');
+    }
+}
+
+// 执行ICE重启 - 新增功能
+async function performIceRestart(peerConnection, userId) {
+    console.log('🔄 ===== 执行ICE重启 =====');
+    console.log('👤 目标用户:', userId);
+    
+    try {
+        // 检查连接是否处于稳定状态
+        if (peerConnection.signalingState !== 'stable') {
+            console.warn('⚠️ 信令状态不稳定，无法执行ICE重启:', peerConnection.signalingState);
+            return false;
+        }
+        
+        console.log('🔄 开始ICE重启流程...');
+        showToast(`正在重新建立与用户 ${userId} 的连接...`, 'info');
+        
+        // 创建带ICE重启的offer
+        const offer = await peerConnection.createOffer({ 
+            iceRestart: true,
+            offerToReceiveAudio: true,
+            offerToReceiveVideo: false
+        });
+        
+        console.log('✅ ICE重启Offer创建成功');
+        
+        // 设置本地描述
+        await peerConnection.setLocalDescription(offer);
+        console.log('✅ ICE重启本地描述设置完成');
+        
+        // 发送ICE重启offer
+        if (window.realtimeClient && window.realtimeClient.socket && window.realtimeClient.socket.connected) {
+            window.realtimeClient.socket.emit('webrtc-offer', {
+                toUserId: userId,
+                fromUserId: currentUserId,
+                offer: offer,
+                isIceRestart: true // 标记为ICE重启
+            });
+            console.log('📤 ICE重启Offer已发送');
+            return true;
+        } else {
+            console.error('❌ WebSocket未连接，无法发送ICE重启offer');
+            return false;
+        }
+        
+    } catch (error) {
+        console.error('❌ ICE重启失败:', error);
+        showToast('连接重启失败', 'error');
+        return false;
+    }
+}
+
+// 自动恢复流 - 新增功能
+async function autoRecoverStream(userId) {
+    console.log('🔄 ===== 自动恢复远程流 =====');
+    console.log('👤 目标用户:', userId);
+    
+    if (!isInCall || !callParticipants.has(userId)) {
+        console.log('⚠️ 通话已结束或用户已离开，跳过流恢复');
+        return false;
+    }
+    
+    try {
+        showToast(`正在恢复与用户 ${userId} 的音频流...`, 'info');
+        
+        // 检查当前的WebRTC连接状态
+        const peerConnection = peerConnections.get(userId);
+        if (!peerConnection) {
+            console.log('❌ 没有找到对应的WebRTC连接，尝试重新建立连接');
+            return await autoAttemptConnectionRepair(userId);
+        }
+        
+        // 检查连接状态
+        if (peerConnection.iceConnectionState === 'connected' || 
+            peerConnection.iceConnectionState === 'completed') {
+            console.log('✅ WebRTC连接正常，可能是轨道问题，尝试重新协商...');
+            
+            // 重新协商媒体
+            const offer = await peerConnection.createOffer({
+                offerToReceiveAudio: true,
+                offerToReceiveVideo: false
+            });
+            
+            await peerConnection.setLocalDescription(offer);
+            
+            // 发送重新协商的offer
+            if (window.realtimeClient && window.realtimeClient.socket && window.realtimeClient.socket.connected) {
+                window.realtimeClient.socket.emit('webrtc-offer', {
+                    toUserId: userId,
+                    fromUserId: currentUserId,
+                    offer: offer,
+                    isRenegotiation: true // 标记为重新协商
+                });
+                console.log('📤 重新协商Offer已发送');
+                return true;
+            }
+        } else {
+            console.log('❌ WebRTC连接状态异常，尝试ICE重启');
+            return await performIceRestart(peerConnection, userId);
+        }
+        
+    } catch (error) {
+        console.error('❌ 自动恢复流失败:', error);
+        showToast('音频流恢复失败', 'error');
+        return false;
+    }
+}
+
+// 创建增强的音频元素 - 新增功能
+function createEnhancedAudioElement(userId, stream) {
+    console.log('🔊 ===== 创建增强音频元素 =====');
+    console.log('👤 用户ID:', userId);
+    
+    // 先清理可能存在的旧元素
+    const existingElement = document.getElementById(`remote-audio-${userId}`);
+    if (existingElement) {
+        console.log('🧹 清理现有音频元素');
+        existingElement.pause();
+        existingElement.srcObject = null;
+        existingElement.remove();
+    }
+    
+    // 创建新的音频元素
+    const audioElement = document.createElement('audio');
+    audioElement.id = `remote-audio-${userId}`;
+    audioElement.setAttribute('data-user-id', userId);
+    
+    // 设置基本属性
+    audioElement.srcObject = stream;
+    audioElement.autoplay = true;
+    audioElement.controls = false;
+    audioElement.muted = !isSpeakerOn;
+    audioElement.style.display = 'none'; // 隐藏元素
+    
+    // 移动设备特殊配置
+    const device = detectDeviceType();
+    if (device.isMobile) {
+        console.log('📱 移动设备 - 应用音频优化配置');
+        audioElement.volume = 0.8; // 稍微降低音量防止回声
+        audioElement.setAttribute('playsinline', true);
+        audioElement.setAttribute('webkit-playsinline', true);
+    } else {
+        audioElement.volume = 1.0;
+    }
+    
+    // 添加增强的事件监听器
+    audioElement.onloadstart = () => {
+        console.log('🔄 音频开始加载:', userId);
+    };
+    
+    audioElement.onloadeddata = () => {
+        console.log('✅ 音频数据加载完成:', userId);
+    };
+    
+    audioElement.oncanplay = () => {
+        console.log('▶️ 音频可以播放:', userId);
+    };
+    
+    audioElement.onplay = () => {
+        console.log('🎵 音频开始播放:', userId);
+        showToast(`开始播放用户 ${userId} 的音频`, 'success');
+    };
+    
+    audioElement.onpause = () => {
+        console.log('⏸️ 音频暂停:', userId);
+    };
+    
+    audioElement.onerror = (error) => {
+        console.error('❌ 音频播放错误:', error, '用户:', userId);
+        showToast(`用户 ${userId} 音频播放出错`, 'error');
+        
+        // 尝试自动恢复
+        setTimeout(() => {
+            console.log('🔄 尝试自动恢复音频播放...');
+            audioElement.load();
+            audioElement.play().catch(e => {
+                console.error('自动恢复播放失败:', e);
+            });
+        }, 1000);
+    };
+    
+    audioElement.onstalled = () => {
+        console.warn('⚠️ 音频播放停滞:', userId);
+    };
+    
+    audioElement.onwaiting = () => {
+        console.log('⏳ 音频等待数据:', userId);
+    };
+    
+    // 添加到DOM
+    document.body.appendChild(audioElement);
+    console.log('✅ 音频元素已添加到DOM');
+    
+    // 尝试播放
+    const playPromise = audioElement.play();
+    if (playPromise !== undefined) {
+        playPromise
+            .then(() => {
+                console.log('✅ 音频自动播放成功:', userId);
+            })
+            .catch(error => {
+                console.warn('⚠️ 音频自动播放失败（可能需要用户交互）:', error);
+                // 显示提示让用户手动启用音频
+                showToast(`请点击允许播放用户 ${userId} 的音频`, 'warning');
+                
+                // 添加点击事件监听器，用户下次点击时自动播放
+                const enableAudio = () => {
+                    audioElement.play().then(() => {
+                        console.log('✅ 用户交互后音频播放成功');
+                        showToast('音频播放已启用', 'success');
+                        document.removeEventListener('click', enableAudio);
+                    }).catch(e => {
+                        console.error('用户交互后播放仍失败:', e);
+                    });
+                };
+                document.addEventListener('click', enableAudio, { once: true });
+            });
+    }
+    
+    return audioElement;
+}
+
+// 网络质量检测 - 新增功能
+async function detectNetworkQuality() {
+    console.log('🌐 ===== 网络质量检测 =====');
+    
+    const quality = {
+        rtt: 0,           // 往返时延
+        bandwidth: 0,     // 带宽估计
+        packetLoss: 0,    // 丢包率
+        jitter: 0,        // 抖动
+        score: 0          // 综合评分 0-100
+    };
+    
+    try {
+        // 简单的网络延迟测试
+        const startTime = performance.now();
+        
+        // 使用多个不同的服务器测试连接质量
+        const testUrls = [
+            'https://www.google.com/favicon.ico',
+            'https://www.cloudflare.com/favicon.ico',
+            'https://www.github.com/favicon.ico'
+        ];
+        
+        const latencyTests = testUrls.map(async (url) => {
+            try {
+                const testStart = performance.now();
+                const response = await fetch(url, { 
+                    method: 'HEAD', 
+                    mode: 'no-cors',
+                    cache: 'no-cache'
+                });
+                const testEnd = performance.now();
+                return testEnd - testStart;
+            } catch (error) {
+                console.warn('网络测试失败:', url, error);
+                return 1000; // 默认高延迟
+            }
+        });
+        
+        const latencies = await Promise.all(latencyTests);
+        const avgLatency = latencies.reduce((a, b) => a + b, 0) / latencies.length;
+        
+        quality.rtt = Math.round(avgLatency);
+        
+        // 基于延迟估算网络质量分数
+        if (quality.rtt < 50) {
+            quality.score = 100;
+        } else if (quality.rtt < 100) {
+            quality.score = 90;
+        } else if (quality.rtt < 200) {
+            quality.score = 70;
+        } else if (quality.rtt < 500) {
+            quality.score = 50;
+        } else {
+            quality.score = 20;
+        }
+        
+        console.log('📊 网络质量检测结果:', quality);
+        return quality;
+        
+    } catch (error) {
+        console.error('❌ 网络质量检测失败:', error);
+        quality.score = 30; // 默认中等质量
+        return quality;
     }
 }
 
