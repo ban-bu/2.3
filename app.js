@@ -706,6 +706,9 @@ function init() {
         document.getElementById('roomId').textContent = `房间: ${roomId}`;
     }
     
+    // 初始化麦克风状态
+    initializeMicrophoneState();
+    
     setupEventListeners();
     setupRealtimeClient();
     
@@ -974,6 +977,22 @@ async function startVoiceCall() {
         
         console.log('✅ 麦克风权限获取成功');
         
+        // 恢复用户的麦克风偏好设置
+        try {
+            const savedPreference = localStorage.getItem('microphonePreference');
+            if (savedPreference !== null) {
+                isMuted = savedPreference === 'true';
+                console.log('🔄 恢复麦克风状态偏好:', isMuted ? '静音' : '开启');
+            } else {
+                // 默认为开启状态
+                isMuted = false;
+                console.log('🎙️ 使用默认麦克风状态: 开启');
+            }
+        } catch (error) {
+            console.warn('⚠️ 无法恢复麦克风状态偏好，使用默认设置:', error);
+            isMuted = false;
+        }
+        
         isInCall = true;
         callStartTime = Date.now();
         
@@ -984,6 +1003,9 @@ async function startVoiceCall() {
         // 更新UI
         updateCallUI();
         showCallPanel();
+        
+        // 同步麦克风UI状态
+        syncMicrophoneUI();
         
         // 同步参与者数据
         syncCallParticipants();
@@ -1042,6 +1064,14 @@ async function startVoiceCall() {
 function cleanupCallResources() {
     console.log('📞 清理通话资源...');
     
+    // 保存当前的麦克风状态偏好
+    try {
+        localStorage.setItem('microphonePreference', isMuted.toString());
+        console.log('💾 保存麦克风状态偏好:', isMuted ? '静音' : '开启');
+    } catch (error) {
+        console.warn('⚠️ 无法保存麦克风状态偏好:', error);
+    }
+    
     // 停止本地流
     if (localStream) {
         localStream.getTracks().forEach(track => track.stop());
@@ -1055,9 +1085,9 @@ function cleanupCallResources() {
     peerConnections.clear();
     remoteStreams.clear();
     
-    // 重置状态
+    // 重置通话状态（但保持麦克风偏好）
     isInCall = false;
-    isMuted = false;
+    // 注意：不再强制重置 isMuted，保持用户偏好
     callParticipants.clear();
     callStartTime = null;
     callDuration = null;
@@ -1123,6 +1153,22 @@ async function acceptCall() {
         
         console.log('✅ 麦克风权限获取成功');
         
+        // 恢复用户的麦克风偏好设置
+        try {
+            const savedPreference = localStorage.getItem('microphonePreference');
+            if (savedPreference !== null) {
+                isMuted = savedPreference === 'true';
+                console.log('🔄 恢复麦克风状态偏好:', isMuted ? '静音' : '开启');
+            } else {
+                // 默认为开启状态
+                isMuted = false;
+                console.log('🎙️ 使用默认麦克风状态: 开启');
+            }
+        } catch (error) {
+            console.warn('⚠️ 无法恢复麦克风状态偏好，使用默认设置:', error);
+            isMuted = false;
+        }
+        
         isInCall = true;
         callStartTime = Date.now();
         callParticipants.add(currentUserId);
@@ -1137,6 +1183,9 @@ async function acceptCall() {
         updateCallUI();
         showCallPanel();
         hideIncomingCallModal();
+        
+        // 同步麦克风UI状态
+        syncMicrophoneUI();
         
         // 同步参与者数据
         syncCallParticipants();
@@ -1181,22 +1230,37 @@ function rejectCall() {
     showToast('已拒绝通话邀请', 'info');
 }
 
-// 切换静音状态
-function toggleMute() {
-    if (!localStream) return;
-    
-    isMuted = !isMuted;
-    localStream.getAudioTracks().forEach(track => {
-        track.enabled = !isMuted;
-    });
-    
-    // 更新UI
+// 同步麦克风UI状态
+function syncMicrophoneUI() {
     const muteBtn = document.getElementById('muteBtn');
     if (muteBtn) {
         muteBtn.classList.toggle('muted', isMuted);
         muteBtn.innerHTML = isMuted ? '<i class="fas fa-microphone-slash"></i>' : '<i class="fas fa-microphone"></i>';
         muteBtn.style.background = isMuted ? '#ef4444' : '#10b981';
+        console.log('🎙️ 同步麦克风UI状态:', isMuted ? '静音' : '开启');
     }
+    
+    // 同步音频track状态
+    if (localStream) {
+        localStream.getAudioTracks().forEach(track => {
+            track.enabled = !isMuted;
+        });
+    }
+    
+    // 延迟验证状态一致性
+    setTimeout(() => {
+        validateMicrophoneState();
+    }, 100);
+}
+
+// 切换静音状态
+function toggleMute() {
+    if (!localStream) return;
+    
+    isMuted = !isMuted;
+    
+    // 同步UI和音频状态
+    syncMicrophoneUI();
     
     // 更新通话参与者列表中的状态
     updateCallParticipants();
@@ -4941,6 +5005,48 @@ let isSpeakerOn = true;
 let callParticipants = new Set();
 let callStartTime = null;
 let callDuration = null;
+
+// 初始化麦克风状态
+function initializeMicrophoneState() {
+    try {
+        const savedPreference = localStorage.getItem('microphonePreference');
+        if (savedPreference !== null) {
+            isMuted = savedPreference === 'true';
+            console.log('🔄 初始化麦克风状态偏好:', isMuted ? '静音' : '开启');
+        } else {
+            // 默认为开启状态
+            isMuted = false;
+            console.log('🎙️ 初始化默认麦克风状态: 开启');
+        }
+    } catch (error) {
+        console.warn('⚠️ 无法初始化麦克风状态偏好，使用默认设置:', error);
+        isMuted = false;
+    }
+}
+
+// 验证麦克风状态一致性
+function validateMicrophoneState() {
+    if (!isInCall || !localStream) return;
+    
+    const audioTracks = localStream.getAudioTracks();
+    if (audioTracks.length === 0) {
+        console.warn('⚠️ 没有音频轨道可用');
+        return;
+    }
+    
+    const actualMuted = !audioTracks[0].enabled;
+    if (actualMuted !== isMuted) {
+        console.warn('⚠️ 检测到麦克风状态不一致，正在修复...');
+        console.log('预期状态:', isMuted ? '静音' : '开启', '实际状态:', actualMuted ? '静音' : '开启');
+        
+        // 修复状态不一致
+        isMuted = actualMuted;
+        syncMicrophoneUI();
+        updateCallParticipants();
+        
+        console.log('✅ 麦克风状态已修复');
+    }
+}
 
 // ==================== 转录面板控制函数 ====================
 
