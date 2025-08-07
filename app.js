@@ -1008,6 +1008,9 @@ async function startVoiceCall() {
         // 同步参与者数据
         syncCallParticipants();
         
+        // 启动自动连接监控
+        startConnectionMonitoring();
+        
         // 通知其他用户加入通话
         console.log('📞 发送通话邀请，roomId:', roomId, 'currentUserId:', currentUserId, 'currentUsername:', currentUsername);
         if (isRealtimeEnabled && window.realtimeClient) {
@@ -1098,6 +1101,9 @@ function cleanupCallResources() {
     callParticipants.clear();
     callStartTime = null;
     callDuration = null;
+    
+    // 停止自动连接监控
+    stopConnectionMonitoring();
     
     // 更新UI
     updateCallUI();
@@ -1195,6 +1201,9 @@ async function acceptCall() {
         
         // 同步参与者数据
         syncCallParticipants();
+        
+        // 启动自动连接监控
+        startConnectionMonitoring();
         
         // 通知发起者已接受
         if (isRealtimeEnabled && window.realtimeClient) {
@@ -1609,66 +1618,192 @@ function createPeerConnection(userId) {
         console.log('🔗 连接状态变化:', peerConnection.connectionState);
     };
     
-    // 添加本地流
+    // 添加本地流 - 增强日志
     if (localStream) {
-        localStream.getTracks().forEach(track => {
-            console.log('📞 添加音频轨道到对等连接:', track.kind, track.enabled);
-            peerConnection.addTrack(track, localStream);
+        console.log('🎙️ ===== 添加本地流到WebRTC连接 =====');
+        console.log('👤 目标用户:', userId);
+        console.log('📦 本地流信息:', {
+            streamId: localStream.id,
+            音频轨道数量: localStream.getAudioTracks().length,
+            视频轨道数量: localStream.getVideoTracks().length
         });
+        
+        localStream.getTracks().forEach((track, index) => {
+            console.log(`📡 添加轨道 ${index + 1}:`, {
+                kind: track.kind,
+                id: track.id,
+                label: track.label,
+                enabled: track.enabled,
+                readyState: track.readyState,
+                muted: track.muted
+            });
+            
+            try {
+                const sender = peerConnection.addTrack(track, localStream);
+                console.log('✅ 轨道添加成功, sender:', !!sender);
+            } catch (error) {
+                console.error('❌ 添加轨道失败:', error);
+            }
+        });
+        
+        console.log('🎙️ ===== 本地流添加完成 =====');
+    } else {
+        console.error('❌ 没有本地流可添加!');
     }
     
-    // 处理远程流 - 改进回声处理
+    // 处理远程流 - 改进回声处理和增强日志
     peerConnection.ontrack = (event) => {
-        console.log('📞 收到远程音频流:', userId, event.streams[0].getTracks());
-        remoteStreams.set(userId, event.streams[0]);
+        console.log('📡 ===== 收到远程音频流 =====');
+        console.log('👤 用户ID:', userId);
+        console.log('📦 事件详情:', {
+            streams数量: event.streams.length,
+            track详情: event.track ? {
+                kind: event.track.kind,
+                id: event.track.id,
+                label: event.track.label,
+                enabled: event.track.enabled,
+                readyState: event.track.readyState,
+                muted: event.track.muted
+            } : '无track信息'
+        });
         
-        // 创建音频播放元素，添加回声预防措施
-        const audioElement = document.createElement('audio');
-        audioElement.srcObject = event.streams[0];
-        audioElement.autoplay = true;
-        audioElement.muted = !isSpeakerOn;
-        
-        // 移动设备特殊配置
-        const device = detectDeviceType();
-        if (device.isMobile) {
-            console.log('📱 移动设备 - 应用回声预防配置');
-            audioElement.volume = 0.8; // 稍微降低音量防止回声
-            audioElement.setAttribute('playsinline', true);
-            audioElement.setAttribute('webkit-playsinline', true);
+        if (event.streams.length > 0) {
+            const stream = event.streams[0];
+            console.log('🎵 音频流信息:', {
+                streamId: stream.id,
+                音频轨道数量: stream.getAudioTracks().length,
+                音频轨道详情: stream.getAudioTracks().map(track => ({
+                    id: track.id,
+                    label: track.label,
+                    enabled: track.enabled,
+                    readyState: track.readyState,
+                    muted: track.muted
+                }))
+            });
             
-            // iOS特殊处理
-            if (device.isIOS) {
-                audioElement.setAttribute('muted', false);
-                audioElement.setAttribute('controls', false);
-                audioElement.style.display = 'none';
+            remoteStreams.set(userId, stream);
+            console.log('✅ 远程流已保存到Map, 当前远程流数量:', remoteStreams.size);
+            
+            // 创建音频播放元素，添加回声预防措施
+            const audioElement = document.createElement('audio');
+            console.log('🔊 开始创建音频播放元素...');
+            
+            // 设置基本属性
+            audioElement.srcObject = stream;
+            audioElement.autoplay = true;
+            audioElement.controls = false; // 隐藏控件
+            audioElement.muted = !isSpeakerOn;
+            
+            // 移动设备特殊配置
+            const device = detectDeviceType();
+            if (device.isMobile) {
+                console.log('📱 移动设备 - 应用回声预防配置');
+                audioElement.volume = 0.8; // 稍微降低音量防止回声
+                audioElement.setAttribute('playsinline', true);
+                audioElement.setAttribute('webkit-playsinline', true);
+                
+                // iOS特殊处理
+                if (device.isIOS) {
+                    audioElement.setAttribute('muted', false);
+                    audioElement.setAttribute('controls', false);
+                    audioElement.style.display = 'none';
+                    console.log('🍎 iOS设备特殊配置已应用');
+                }
+            } else {
+                audioElement.volume = 1.0;
+                console.log('💻 桌面设备配置已应用');
+            }
+            
+            // 添加详细的音频事件监听
+            audioElement.onloadstart = () => {
+                console.log('🎵 音频开始加载 - 用户:', userId);
+            };
+            
+            audioElement.onloadedmetadata = () => {
+                console.log('✅ 远程音频元数据加载完成 - 用户:', userId, {
+                    duration: audioElement.duration,
+                    networkState: audioElement.networkState,
+                    readyState: audioElement.readyState
+                });
+            };
+            
+            audioElement.oncanplay = () => {
+                console.log('✅ 远程音频可以播放 - 用户:', userId);
+            };
+            
+            audioElement.onplay = () => {
+                console.log('🎉 远程音频开始播放 - 用户:', userId, {
+                    currentTime: audioElement.currentTime,
+                    volume: audioElement.volume,
+                    muted: audioElement.muted
+                });
+            };
+            
+            audioElement.onpause = () => {
+                console.log('⏸️ 远程音频暂停 - 用户:', userId);
+            };
+            
+            audioElement.onended = () => {
+                console.log('🏁 远程音频结束 - 用户:', userId);
+            };
+            
+            audioElement.onerror = (error) => {
+                console.error('❌ 远程音频播放错误 - 用户:', userId, {
+                    error: error,
+                    code: audioElement.error ? audioElement.error.code : '未知',
+                    message: audioElement.error ? audioElement.error.message : '未知错误'
+                });
+            };
+            
+            audioElement.onabort = () => {
+                console.warn('⚠️ 远程音频播放中止 - 用户:', userId);
+            };
+            
+            audioElement.onstalled = () => {
+                console.warn('⚠️ 远程音频播放停滞 - 用户:', userId);
+            };
+            
+            audioElement.onwaiting = () => {
+                console.log('⏳ 远程音频等待数据 - 用户:', userId);
+            };
+            
+            // 设置音频元素ID以便管理
+            audioElement.id = `remote-audio-${userId}`;
+            audioElement.setAttribute('data-user-id', userId);
+            
+            console.log('📝 音频元素ID设置:', audioElement.id);
+            
+            // 添加到DOM
+            document.body.appendChild(audioElement);
+            console.log('✅ 音频元素已添加到DOM');
+            
+            // 验证添加是否成功
+            const verifyElement = document.getElementById(`remote-audio-${userId}`);
+            if (verifyElement) {
+                console.log('✅ 音频元素添加验证成功');
+            } else {
+                console.error('❌ 音频元素添加验证失败!');
             }
         } else {
-            audioElement.volume = 1.0;
+            console.error('❌ 没有接收到音频流!');
         }
         
-        // 添加音频事件监听
-        audioElement.onloadedmetadata = () => {
-            console.log('📞 远程音频元数据加载完成');
-        };
-        
-        audioElement.onplay = () => {
-            console.log('📞 远程音频开始播放');
-        };
-        
-        audioElement.onerror = (error) => {
-            console.error('📞 远程音频播放错误:', error);
-        };
-        
-        // 设置音频元素ID以便管理
-        audioElement.id = `remote-audio-${userId}`;
-        audioElement.setAttribute('data-user-id', userId);
-        
-        document.body.appendChild(audioElement);
+        console.log('📡 ===== 远程音频流处理完成 =====');
     };
     
-    // 处理ICE候选
+    // 处理ICE候选 - 增强日志
     peerConnection.onicecandidate = (event) => {
         if (event.candidate) {
+            console.log('🧊 收集到ICE候选:', {
+                用户ID: userId,
+                候选类型: event.candidate.type,
+                协议: event.candidate.protocol,
+                地址: event.candidate.address,
+                端口: event.candidate.port,
+                foundation: event.candidate.foundation,
+                priority: event.candidate.priority
+            });
+            
             if (isRealtimeEnabled && window.realtimeClient) {
                 window.realtimeClient.sendIceCandidate({
                     roomId,
@@ -1676,7 +1811,12 @@ function createPeerConnection(userId) {
                     candidate: event.candidate,
                     fromUserId: currentUserId
                 });
+                console.log('📤 已发送ICE候选给用户:', userId);
+            } else {
+                console.error('❌ 无法发送ICE候选 - 实时通信未启用');
             }
+        } else {
+            console.log('🏁 ICE候选收集完成 - 用户:', userId);
         }
     };
     
@@ -1834,72 +1974,156 @@ function syncCallParticipants() {
     });
 }
 
-// 处理WebRTC offer
+// 处理WebRTC offer - 增强日志
 async function handleCallOffer(data) {
-    console.log('📞 收到WebRTC offer:', data);
+    console.log('📞 ===== 处理WebRTC Offer =====');
+    console.log('👤 来源用户:', data.fromUserId);
+    console.log('📦 Offer详情:', {
+        type: data.offer.type,
+        sdp: data.offer.sdp ? '已包含SDP' : '无SDP'
+    });
     
+    console.log('🔗 创建对等连接...');
     const peerConnection = createPeerConnection(data.fromUserId);
     
     try {
+        console.log('📝 设置远程描述...');
         await peerConnection.setRemoteDescription(new RTCSessionDescription(data.offer));
+        console.log('✅ 远程描述设置成功');
+        
+        console.log('📝 创建Answer...');
         const answer = await peerConnection.createAnswer();
+        console.log('✅ Answer创建成功, 类型:', answer.type);
+        
+        console.log('📝 设置本地描述...');
         await peerConnection.setLocalDescription(answer);
+        console.log('✅ 本地描述设置成功');
+        
+        console.log('🔗 WebRTC连接状态:', {
+            iceConnectionState: peerConnection.iceConnectionState,
+            connectionState: peerConnection.connectionState,
+            signalingState: peerConnection.signalingState,
+            iceGatheringState: peerConnection.iceGatheringState
+        });
         
         if (isRealtimeEnabled && window.realtimeClient) {
+            console.log('📤 发送Answer给用户:', data.fromUserId);
             window.realtimeClient.sendCallAnswer({
                 roomId,
                 targetUserId: data.fromUserId,
                 answer: peerConnection.localDescription,
                 fromUserId: currentUserId
             });
+            console.log('✅ Answer已发送');
+        } else {
+            console.error('❌ 无法发送Answer - 实时通信未启用');
         }
     } catch (error) {
         console.error('❌ 处理offer失败:', error);
+        console.error('错误详情:', {
+            name: error.name,
+            message: error.message,
+            stack: error.stack
+        });
     }
+    
+    console.log('📞 ===== Offer处理完成 =====');
 }
 
-// 处理WebRTC answer
+// 处理WebRTC answer - 增强日志
 async function handleCallAnswer(data) {
-    console.log('📞 收到WebRTC answer:', data);
+    console.log('📞 ===== 处理WebRTC Answer =====');
+    console.log('👤 来源用户:', data.fromUserId);
+    console.log('📦 Answer详情:', {
+        type: data.answer.type,
+        sdp: data.answer.sdp ? '已包含SDP' : '无SDP'
+    });
     
     const peerConnection = peerConnections.get(data.fromUserId);
     if (peerConnection) {
+        console.log('🔗 找到对等连接, 当前状态:', {
+            iceConnectionState: peerConnection.iceConnectionState,
+            connectionState: peerConnection.connectionState,
+            signalingState: peerConnection.signalingState,
+            iceGatheringState: peerConnection.iceGatheringState
+        });
+        
         try {
             // 检查连接状态，只有在have-local-offer状态下才能设置远程描述
             if (peerConnection.signalingState === 'have-local-offer') {
+                console.log('✅ 信令状态正确，设置远程描述...');
                 await peerConnection.setRemoteDescription(new RTCSessionDescription(data.answer));
-                console.log('✅ Answer设置成功，信令状态:', peerConnection.signalingState);
+                console.log('✅ Answer设置成功，新的信令状态:', peerConnection.signalingState);
                 
                 // 处理暂存的ICE候选
                 if (peerConnection.pendingIceCandidates && peerConnection.pendingIceCandidates.length > 0) {
-                    console.log('📞 处理暂存的ICE候选:', peerConnection.pendingIceCandidates.length);
+                    console.log('📦 处理暂存的ICE候选, 数量:', peerConnection.pendingIceCandidates.length);
                     for (const candidate of peerConnection.pendingIceCandidates) {
                         try {
                             await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+                            console.log('✅ 暂存ICE候选添加成功');
                         } catch (error) {
                             console.error('❌ 添加暂存ICE候选失败:', error);
                         }
                     }
                     peerConnection.pendingIceCandidates = [];
+                    console.log('✅ 所有暂存ICE候选处理完成');
                 }
+                
+                console.log('🔗 Answer处理后的连接状态:', {
+                    iceConnectionState: peerConnection.iceConnectionState,
+                    connectionState: peerConnection.connectionState,
+                    signalingState: peerConnection.signalingState,
+                    iceGatheringState: peerConnection.iceGatheringState
+                });
             } else {
-                console.warn('⚠️ 信令状态不正确，无法设置answer:', peerConnection.signalingState);
+                console.warn('⚠️ 信令状态不正确，无法设置answer');
+                console.warn('当前状态:', peerConnection.signalingState, '期望状态: have-local-offer');
             }
         } catch (error) {
             console.error('❌ 处理answer失败:', error);
+            console.error('错误详情:', {
+                name: error.name,
+                message: error.message,
+                stack: error.stack
+            });
         }
+    } else {
+        console.error('❌ 找不到对应的对等连接! 用户ID:', data.fromUserId);
+        console.log('🔍 当前所有对等连接:', Array.from(peerConnections.keys()));
     }
+    
+    console.log('📞 ===== Answer处理完成 =====');
 }
 
-// 处理ICE候选
+// 处理ICE候选 - 增强日志
 async function handleIceCandidate(data) {
-    console.log('📞 收到ICE候选:', data);
+    console.log('🧊 ===== 处理ICE候选 =====');
+    console.log('👤 来源用户:', data.fromUserId);
+    console.log('🎯 目标用户:', data.targetUserId);
+    console.log('📦 候选信息:', {
+        type: data.candidate.type,
+        protocol: data.candidate.protocol,
+        address: data.candidate.address,
+        port: data.candidate.port,
+        foundation: data.candidate.foundation,
+        priority: data.candidate.priority,
+        component: data.candidate.component
+    });
     
     const peerConnection = peerConnections.get(data.fromUserId);
     if (peerConnection) {
+        console.log('🔗 找到对等连接, 当前状态:', {
+            iceConnectionState: peerConnection.iceConnectionState,
+            connectionState: peerConnection.connectionState,
+            signalingState: peerConnection.signalingState,
+            hasRemoteDescription: !!peerConnection.remoteDescription
+        });
+        
         try {
             // 检查连接状态，确保远程描述已设置
             if (peerConnection.remoteDescription) {
+                console.log('✅ 远程描述已设置，添加ICE候选...');
                 await peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
                 console.log('✅ ICE候选添加成功');
             } else {
@@ -1909,11 +2133,17 @@ async function handleIceCandidate(data) {
                     peerConnection.pendingIceCandidates = [];
                 }
                 peerConnection.pendingIceCandidates.push(data.candidate);
+                console.log('📦 ICE候选已暂存, 暂存队列长度:', peerConnection.pendingIceCandidates.length);
             }
         } catch (error) {
             console.error('❌ 添加ICE候选失败:', error);
         }
+    } else {
+        console.error('❌ 找不到对应的对等连接! 用户ID:', data.fromUserId);
+        console.log('🔍 当前所有对等连接:', Array.from(peerConnections.keys()));
     }
+    
+    console.log('🧊 ===== ICE候选处理完成 =====');
 }
 
 // 处理静音状态
@@ -5249,6 +5479,192 @@ function debugWebRTCConnections() {
 
 // 将调试函数暴露到全局，方便开发者调用
 window.debugWebRTC = debugWebRTCConnections;
+
+// 暴露手动播放音频的函数，用于解决移动端自动播放限制
+window.forcePlayRemoteAudio = function() {
+    console.log('🔊 手动播放所有远程音频...');
+    const audioElements = document.querySelectorAll('audio[data-user-id]');
+    
+    audioElements.forEach(audio => {
+        const userId = audio.getAttribute('data-user-id');
+        console.log(`🎵 尝试播放用户 ${userId} 的音频...`);
+        
+        if (audio.paused) {
+            audio.play().then(() => {
+                console.log(`✅ 用户 ${userId} 音频播放成功`);
+            }).catch(error => {
+                console.error(`❌ 用户 ${userId} 音频播放失败:`, error);
+            });
+        } else {
+            console.log(`✅ 用户 ${userId} 音频已在播放`);
+        }
+    });
+    
+    console.log(`🔊 共处理 ${audioElements.length} 个音频元素`);
+};
+
+// 暴露获取详细音频信息的函数
+window.getAudioInfo = function() {
+    console.log('🔍 ===== 音频信息详情 =====');
+    
+    // 本地流信息
+    if (localStream) {
+        console.log('🎙️ 本地流:', {
+            id: localStream.id,
+            active: localStream.active,
+            tracks: localStream.getTracks().map(track => ({
+                kind: track.kind,
+                id: track.id,
+                label: track.label,
+                enabled: track.enabled,
+                readyState: track.readyState,
+                muted: track.muted
+            }))
+        });
+    } else {
+        console.log('⚠️ 没有本地流');
+    }
+    
+    // 远程流信息
+    console.log('📡 远程流数量:', remoteStreams.size);
+    remoteStreams.forEach((stream, userId) => {
+        console.log(`📡 用户 ${userId} 远程流:`, {
+            id: stream.id,
+            active: stream.active,
+            tracks: stream.getTracks().map(track => ({
+                kind: track.kind,
+                id: track.id,
+                label: track.label,
+                enabled: track.enabled,
+                readyState: track.readyState,
+                muted: track.muted
+            }))
+        });
+    });
+    
+    // 音频元素信息
+    const audioElements = document.querySelectorAll('audio[data-user-id]');
+    console.log('🔊 音频元素数量:', audioElements.length);
+    audioElements.forEach(audio => {
+        const userId = audio.getAttribute('data-user-id');
+        console.log(`🔊 用户 ${userId} 音频元素:`, {
+            id: audio.id,
+            paused: audio.paused,
+            volume: audio.volume,
+            muted: audio.muted,
+            readyState: audio.readyState,
+            networkState: audio.networkState,
+            currentTime: audio.currentTime,
+            duration: audio.duration,
+            autoplay: audio.autoplay,
+            controls: audio.controls,
+            srcObject: !!audio.srcObject,
+            error: audio.error ? {
+                code: audio.error.code,
+                message: audio.error.message
+            } : null
+        });
+    });
+    
+    console.log('🔍 ===== 音频信息详情结束 =====');
+};
+
+// 自动连接状态监控
+let connectionMonitorInterval = null;
+
+// 启动自动连接监控
+function startConnectionMonitoring() {
+    if (connectionMonitorInterval) {
+        clearInterval(connectionMonitorInterval);
+    }
+    
+    console.log('🔍 启动WebRTC连接状态自动监控...');
+    
+    connectionMonitorInterval = setInterval(() => {
+        if (isInCall && peerConnections.size > 0) {
+            console.log('📊 ===== WebRTC连接状态报告 =====');
+            console.log('⏰ 时间:', new Date().toLocaleTimeString());
+            console.log('📞 通话状态:', isInCall);
+            console.log('👥 参与者数量:', callParticipants.size);
+            console.log('🔗 对等连接数量:', peerConnections.size);
+            console.log('📡 远程流数量:', remoteStreams.size);
+            
+            // 检查本地流状态
+            if (localStream) {
+                const audioTracks = localStream.getAudioTracks();
+                console.log('🎙️ 本地音频轨道:', {
+                    数量: audioTracks.length,
+                    详情: audioTracks.map(track => ({
+                        enabled: track.enabled,
+                        readyState: track.readyState,
+                        label: track.label,
+                        muted: track.muted
+                    }))
+                });
+            } else {
+                console.warn('⚠️ 本地流不存在!');
+            }
+            
+            // 检查每个对等连接的状态
+            peerConnections.forEach((pc, userId) => {
+                const stats = {
+                    用户ID: userId,
+                    ICE连接状态: pc.iceConnectionState,
+                    连接状态: pc.connectionState,
+                    信令状态: pc.signalingState,
+                    ICE收集状态: pc.iceGatheringState
+                };
+                
+                console.log(`🔗 用户 ${userId} 连接详情:`, stats);
+                
+                // 检查对应的远程流
+                const remoteStream = remoteStreams.get(userId);
+                if (remoteStream) {
+                    const remoteTracks = remoteStream.getAudioTracks();
+                    console.log(`📡 用户 ${userId} 远程音频轨道:`, {
+                        数量: remoteTracks.length,
+                        详情: remoteTracks.map(track => ({
+                            enabled: track.enabled,
+                            readyState: track.readyState,
+                            label: track.label,
+                            muted: track.muted
+                        }))
+                    });
+                } else {
+                    console.warn(`⚠️ 用户 ${userId} 没有远程流!`);
+                }
+                
+                // 检查对应的音频元素
+                const audioElement = document.getElementById(`remote-audio-${userId}`);
+                if (audioElement) {
+                    console.log(`🔊 用户 ${userId} 音频元素状态:`, {
+                        paused: audioElement.paused,
+                        volume: audioElement.volume,
+                        muted: audioElement.muted,
+                        readyState: audioElement.readyState,
+                        currentTime: audioElement.currentTime,
+                        duration: audioElement.duration,
+                        networkState: audioElement.networkState,
+                        srcObject: !!audioElement.srcObject
+                    });
+                } else {
+                    console.warn(`⚠️ 用户 ${userId} 没有音频播放元素!`);
+                }
+            });
+            
+            console.log('📊 ===== 监控报告结束 =====\n');
+        }
+    }, 5000); // 每5秒输出一次状态
+}
+
+// 停止自动连接监控
+function stopConnectionMonitoring() {
+    if (connectionMonitorInterval) {
+        clearInterval(connectionMonitorInterval);
+        connectionMonitorInterval = null;
+        console.log('🛑 停止WebRTC连接状态监控');
+    }
+}
 
 // ==================== 转录面板控制函数 ====================
 
