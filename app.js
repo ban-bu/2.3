@@ -1767,6 +1767,7 @@ function createPeerConnection(userId, enhanced = false) {
     
     const peerConnection = new RTCPeerConnection(configuration);
     attachCodecPreference(peerConnection);
+    setupKeepaliveDataChannel(peerConnection, userId);
     
     // 设置连接超时计时器
     const connectionTimeout = setTimeout(() => {
@@ -5911,35 +5912,49 @@ function attachCodecPreference(peerConnection) {
 function startPeerAudioMonitor(userId, peerConnection) {
     try {
         if (peerConnection._audioMonitorInterval) clearInterval(peerConnection._audioMonitorInterval);
-        let lastBytes = 0;
+        let lastInboundBytes = 0;
+        let lastOutboundBytes = 0;
         let stagnantCount = 0;
         peerConnection._audioMonitorInterval = setInterval(async () => {
             try {
                 const stats = await peerConnection.getStats(null);
                 let inboundAudio = null;
+                let outboundAudio = null;
                 stats.forEach(report => {
                     if (report.type === 'inbound-rtp' && report.kind === 'audio') {
                         inboundAudio = report;
                     }
+                    if (report.type === 'outbound-rtp' && report.kind === 'audio') {
+                        outboundAudio = report;
+                    }
                 });
-                if (!inboundAudio) return;
-                const bytes = inboundAudio.bytesReceived || 0;
-                if (bytes <= lastBytes) {
-                    stagnantCount += 1;
-                } else {
-                    stagnantCount = 0;
-                }
-                lastBytes = bytes;
+                if (!inboundAudio && !outboundAudio) return;
+                const inboundBytes = inboundAudio ? (inboundAudio.bytesReceived || 0) : lastInboundBytes;
+                const outboundBytes = outboundAudio ? (outboundAudio.bytesSent || 0) : lastOutboundBytes;
+                const inboundStall = inboundBytes <= lastInboundBytes;
+                const outboundStall = outboundBytes <= lastOutboundBytes;
+                if (inboundStall && outboundStall) stagnantCount += 1; else stagnantCount = 0;
+                lastInboundBytes = inboundBytes;
+                lastOutboundBytes = outboundBytes;
 
-                // 若連續 5 次無增長（約15秒），視為無音頻流動
-                if (stagnantCount >= 5) {
+                // 若連續 2 次無增長（約~6秒），視為無音頻流動，先嘗試 ICE 重啟
+                if (stagnantCount >= 2) {
                     console.warn(`🛑 檢測到用戶 ${userId} 音頻無流動，觸發修復`);
                     stagnantCount = 0;
-                    if (!forceRelayMode) {
-                        forceRelayMode = true;
-                        console.warn('🛡️ 開啟 relay-only 回退並重建連線');
+                    try {
+                        if (peerConnection.signalingState === 'stable') {
+                            const restarted = await performIceRestart(peerConnection, userId);
+                            if (!restarted) throw new Error('ICE 重啟未觸發');
+                        } else {
+                            throw new Error('信令不穩定，跳過 ICE 重啟');
+                        }
+                    } catch (e) {
+                        if (!forceRelayMode) {
+                            forceRelayMode = true;
+                            console.warn('🛡️ 開啟 relay-only 回退並重建連線');
+                        }
+                        await autoAttemptConnectionRepair(userId);
                     }
-                    await autoAttemptConnectionRepair(userId);
                 }
             } catch (e) {
                 // 忽略一次性錯誤
@@ -5947,6 +5962,32 @@ function startPeerAudioMonitor(userId, peerConnection) {
         }, 3000);
     } catch (e) {
         console.warn('啟動音頻監控失敗', e);
+    }
+}
+
+function setupKeepaliveDataChannel(peerConnection, userId) {
+    try {
+        // 若已存在，先清理
+        if (peerConnection._keepaliveInterval) clearInterval(peerConnection._keepaliveInterval);
+        // 使用 negotiated 模式確保兩端一致，不依賴 ondatachannel
+        const dc = peerConnection.createDataChannel('keepalive', { negotiated: true, id: 0 });
+        peerConnection._keepaliveChannel = dc;
+        dc.onopen = () => {
+            peerConnection._keepaliveInterval = setInterval(() => {
+                if (dc.readyState === 'open') {
+                    try { dc.send('ping:' + Date.now()); } catch {}
+                }
+            }, 5000);
+        };
+        dc.onclose = () => {
+            if (peerConnection._keepaliveInterval) {
+                clearInterval(peerConnection._keepaliveInterval);
+                peerConnection._keepaliveInterval = null;
+            }
+        };
+        dc.onerror = () => {};
+    } catch (e) {
+        console.warn('建立 keepalive DataChannel 失敗', e);
     }
 }
 
@@ -6580,6 +6621,7 @@ function createEnhancedPeerConnection(userId) {
     
     const peerConnection = new RTCPeerConnection(enhancedConfig);
     attachCodecPreference(peerConnection);
+    setupKeepaliveDataChannel(peerConnection, userId);
     
     // 添加本地流
     if (localStream) {
