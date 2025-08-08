@@ -1087,6 +1087,29 @@ app.get('/api/health', (req, res) => {
     });
 });
 
+// 提供 ICE 配置，便於客戶端根據環境自動使用專用 TURN
+app.get('/api/ice', (req, res) => {
+    const stun = (process.env.STUN_SERVERS || '')
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean)
+        .map(url => ({ urls: url }));
+    const turnsEnv = (process.env.TURN_SERVERS || '').trim();
+    // TURN_SERVERS 形如：
+    // turn:host:port?transport=tcp|username|credential,turns:host:5349|u|p
+    const turnServers = turnsEnv
+        ? turnsEnv.split(',').map(entry => {
+            const [urls, username, credential] = entry.split('|');
+            return { urls, username, credential };
+        })
+        : [];
+
+    res.json({
+        stunServers: stun,
+        turnServers
+    });
+});
+
 // Railway健康检查端点
 app.get('/health', (req, res) => {
     res.status(200).json({

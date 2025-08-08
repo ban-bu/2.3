@@ -1008,28 +1008,34 @@ async function startVoiceCall() {
         // 同步参与者数据
         syncCallParticipants();
         
+        // 優先嘗試從服務端獲取 ICE 配置（不阻塞太久）
+        try {
+            await Promise.race([
+                loadServerIceConfig(),
+                new Promise((resolve) => setTimeout(resolve, 1500))
+            ]);
+        } catch (e) {
+            console.warn('拉取服務端 ICE 配置失敗，使用內建配置', e);
+        }
+
         // 启动自动连接监控
         startConnectionMonitoring();
         
-        // 快速网络连接检查（不阻塞通话流程）
+        // 快速网络连接检查（不阻塞通话流程）：自動選擇可用 TURN
         setTimeout(async () => {
-            console.log('🔍 开始快速网络连接检查...');
+            console.log('🔍 開始快速 TURN 可用性檢查...');
             try {
-                // 只测试一个TURN服务器以快速检查
-                const turnTest = await testTurnServer({
-                    urls: 'turn:openrelay.metered.ca:80',
-                    username: 'openrelayproject',
-                    credential: 'openrelayproject'
-                });
-                
-                if (!turnTest.success) {
-                    console.warn('⚠️ 快速TURN测试失败! 跨网络通话可能有问题');
-                    console.log('💡 运行 testNetworkConnectivity() 进行完整诊断');
+                const best = await selectBestTurnServer();
+                if (best) {
+                    console.log('✅ 已選擇可用 TURN:', best.urls);
+                    preferredTurnServer = best;
+                } else {
+                    console.warn('⚠️ 未找到可用 TURN，跨網路可能有問題');
                 }
             } catch (error) {
-                console.warn('⚠️ 网络检查异常:', error);
+                console.warn('⚠️ 快速選擇 TURN 發生異常:', error);
             }
-        }, 3000); // 3秒后开始检查，不影响通话启动
+        }, 2000);
         
         // 通知其他用户加入通话
         console.log('📞 ===== 发送通话邀请 =====');
@@ -1629,6 +1635,31 @@ function createPeerConnection(userId, enhanced = false) {
         console.log('🚀 网络不稳定或明确要求，使用增强连接配置...');
         return createEnhancedPeerConnection(userId);
     }
+    // 若啟用僅走 TURN（relay-only），以最小可用 TURN 集合覆蓋配置
+    if (forceRelayMode) {
+        console.warn('🛡️ 已啟用 relay-only 模式，將僅使用 TURN 轉發');
+        const relayServers = [];
+        if (preferredTurnServer) relayServers.push(preferredTurnServer);
+        // 後備公共 TURN（注意：公共服務可靠性有限，建議配置自有 TURN）
+        relayServers.push(
+            { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+            { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
+        );
+        const relayConfig = {
+            iceServers: relayServers,
+            iceTransportPolicy: 'relay',
+            bundlePolicy: 'max-bundle',
+            rtcpMuxPolicy: 'require',
+            iceCandidatePoolSize: 10
+        };
+        const relayPc = new RTCPeerConnection(relayConfig);
+        if (localStream) {
+            localStream.getTracks().forEach(track => relayPc.addTrack(track, localStream));
+        }
+        peerConnections.set(userId, relayPc);
+        return relayPc;
+    }
+
     const configuration = {
         iceServers: [
             // Google公共STUN服务器
@@ -5773,6 +5804,45 @@ let remoteStreams = new Map(); // userId -> MediaStream
 let peerConnections = new Map(); // userId -> RTCPeerConnection
 let isInCall = false;
 let isMuted = false;
+
+// 跨網路連線強化：全域偏好 TURN 與 relay-only 模式
+let preferredTurnServer = null; // { urls, username, credential }
+let forceRelayMode = false;     // 當為 true 時，建立連線將強制僅使用 TURN (relay)
+// 嘗試從服務端拉取 ICE 配置
+async function loadServerIceConfig() {
+    try {
+        const res = await fetch('/api/ice', { cache: 'no-cache' });
+        if (!res.ok) return false;
+        const data = await res.json();
+        if (data && Array.isArray(data.turnServers) && data.turnServers.length > 0) {
+            preferredTurnServer = data.turnServers[0];
+            console.log('☁️ 從服務端獲取 TURN:', preferredTurnServer);
+            return true;
+        }
+        return false;
+    } catch (e) {
+        console.warn('獲取服務端 ICE 配置失敗:', e);
+        return false;
+    }
+}
+
+// 掃描一組 TURN，選擇可用的最佳候選
+async function selectBestTurnServer() {
+    const candidates = [];
+    if (preferredTurnServer) candidates.push(preferredTurnServer);
+    candidates.push(
+        { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+        { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
+        { urls: 'turns:relay1.expressturn.com:5349', username: 'ef4CVDZETE4TAMK426', credential: 'ugBu0jkKWIE6tIGG' }
+    );
+    for (const s of candidates) {
+        try {
+            const r = await testTurnServer(s);
+            if (r && r.success) return s;
+        } catch {}
+    }
+    return null;
+}
 let isSpeakerOn = true;
 let callParticipants = new Set();
 let callStartTime = null;
@@ -6380,15 +6450,31 @@ function createEnhancedPeerConnection(userId) {
         }
     ];
     
-    const enhancedConfig = {
+    let enhancedConfig = {
         iceServers: enhancedIceServers,
-        iceCandidatePoolSize: 20, // 增加候选池大小
+        iceCandidatePoolSize: 20,
         iceTransportPolicy: 'all',
         bundlePolicy: 'max-bundle',
-        rtcpMuxPolicy: 'require',
-        // 更激进的ICE配置
-        iceGatheringState: 'gathering'
+        rtcpMuxPolicy: 'require'
     };
+
+    // 若強制 relay，套用 relay-only 並優先使用偏好 TURN
+    if (forceRelayMode) {
+        console.warn('🛡️ 增强连接使用 relay-only 模式');
+        const servers = [];
+        if (preferredTurnServer) servers.push(preferredTurnServer);
+        servers.push(
+            { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+            { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
+        );
+        enhancedConfig = {
+            iceServers: servers,
+            iceTransportPolicy: 'relay',
+            bundlePolicy: 'max-bundle',
+            rtcpMuxPolicy: 'require',
+            iceCandidatePoolSize: 10
+        };
+    }
     
     const peerConnection = new RTCPeerConnection(enhancedConfig);
     
@@ -7210,6 +7296,22 @@ function startConnectionMonitoring() {
                     monitoringInterval = Math.max(monitoringInterval, 8000); // 降低监控频率
                 }
                 
+                // 若長時間處於 ICE new/無遠程流，啟用 relay-only 進行回退
+                const stuckNew = Array.from(peerConnections.values()).some(pc => pc.iceConnectionState === 'new');
+                const noRemote = Array.from(peerConnections.keys()).some(uid => !remoteStreams.has(uid));
+                if ((stuckNew || noRemote) && !forceRelayMode) {
+                    console.warn('🛡️ 連線卡在 new 或無遠程流，啟用 relay-only 回退並重建');
+                    forceRelayMode = true;
+                    // 逐個重建
+                    for (const uid of Array.from(peerConnections.keys())) {
+                        try {
+                            await autoAttemptConnectionRepair(uid);
+                        } catch (e) {
+                            console.warn('回退重建失敗:', uid, e);
+                        }
+                    }
+                }
+
                 autoShowCompleteStatus();
                 
                 // 🚀 智能修复策略
@@ -7480,21 +7582,19 @@ async function detectNetworkQuality() {
         // 简单的网络延迟测试
         const startTime = performance.now();
         
-        // 使用多个不同的服务器测试连接质量
+        // 使用多區域可達的端點，兼顧中國大陸/香港
         const testUrls = [
-            'https://www.google.com/favicon.ico',
+            'https://www.baidu.com/favicon.ico',
+            'https://www.qq.com/favicon.ico',
+            'https://www.aliyun.com/favicon.ico',
             'https://www.cloudflare.com/favicon.ico',
-            'https://www.github.com/favicon.ico'
+            'https://www.fastly.com/favicon.ico'
         ];
         
         const latencyTests = testUrls.map(async (url) => {
             try {
                 const testStart = performance.now();
-                const response = await fetch(url, { 
-                    method: 'HEAD', 
-                    mode: 'no-cors',
-                    cache: 'no-cache'
-                });
+                const response = await fetch(url, { method: 'HEAD', cache: 'no-cache' });
                 const testEnd = performance.now();
                 return testEnd - testStart;
             } catch (error) {
