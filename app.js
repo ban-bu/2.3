@@ -1760,6 +1760,7 @@ function createPeerConnection(userId, enhanced = false) {
     });
     
     const peerConnection = new RTCPeerConnection(configuration);
+    attachCodecPreference(peerConnection);
     
     // 设置连接超时计时器
     const connectionTimeout = setTimeout(() => {
@@ -2118,6 +2119,7 @@ function createPeerConnection(userId, enhanced = false) {
         }
     };
     
+    startPeerAudioMonitor(userId, peerConnection);
     peerConnections.set(userId, peerConnection);
     return peerConnection;
 }
@@ -5848,6 +5850,100 @@ let callParticipants = new Set();
 let callStartTime = null;
 let callDuration = null;
 
+// ========== 通話底層重構：編解碼優先、完美協商、音頻健康監控 ==========
+function preferOpusInSdp(sessionDescriptionSdp) {
+    try {
+        const sdpLines = sessionDescriptionSdp.split('\n');
+        const mLineIndex = sdpLines.findIndex(line => line.startsWith('m=audio'));
+        if (mLineIndex === -1) return sessionDescriptionSdp;
+
+        // 找到 opus payload type
+        const opusRegex = /^a=rtpmap:(\d+) opus\/(\d+)/i;
+        const opusPayloads = sdpLines
+            .map(line => {
+                const match = line.match(opusRegex);
+                return match ? match[1] : null;
+            })
+            .filter(Boolean);
+
+        if (opusPayloads.length === 0) return sessionDescriptionSdp;
+
+        const mLineParts = sdpLines[mLineIndex].trim().split(' ');
+        // m=audio <port> <proto> <payloads...>
+        const header = mLineParts.slice(0, 3);
+        const payloads = mLineParts.slice(3);
+
+        // 將 opus 放到最前
+        const reordered = [...opusPayloads, ...payloads.filter(p => !opusPayloads.includes(p))];
+        sdpLines[mLineIndex] = [...header, ...reordered].join(' ');
+        return sdpLines.join('\n');
+    } catch (e) {
+        console.warn('編解碼優先處理失敗，使用原始SDP', e);
+        return sessionDescriptionSdp;
+    }
+}
+
+function attachCodecPreference(peerConnection) {
+    const originalCreateOffer = peerConnection.createOffer.bind(peerConnection);
+    peerConnection.createOffer = async (options) => {
+        const offer = await originalCreateOffer(options);
+        if (offer && offer.sdp) {
+            offer.sdp = preferOpusInSdp(offer.sdp);
+        }
+        return offer;
+    };
+    const originalCreateAnswer = peerConnection.createAnswer.bind(peerConnection);
+    peerConnection.createAnswer = async (options) => {
+        const answer = await originalCreateAnswer(options);
+        if (answer && answer.sdp) {
+            answer.sdp = preferOpusInSdp(answer.sdp);
+        }
+        return answer;
+    };
+}
+
+function startPeerAudioMonitor(userId, peerConnection) {
+    try {
+        if (peerConnection._audioMonitorInterval) clearInterval(peerConnection._audioMonitorInterval);
+        let lastBytes = 0;
+        let stagnantCount = 0;
+        peerConnection._audioMonitorInterval = setInterval(async () => {
+            try {
+                const stats = await peerConnection.getStats(null);
+                let inboundAudio = null;
+                stats.forEach(report => {
+                    if (report.type === 'inbound-rtp' && report.kind === 'audio') {
+                        inboundAudio = report;
+                    }
+                });
+                if (!inboundAudio) return;
+                const bytes = inboundAudio.bytesReceived || 0;
+                if (bytes <= lastBytes) {
+                    stagnantCount += 1;
+                } else {
+                    stagnantCount = 0;
+                }
+                lastBytes = bytes;
+
+                // 若連續 5 次無增長（約15秒），視為無音頻流動
+                if (stagnantCount >= 5) {
+                    console.warn(`🛑 檢測到用戶 ${userId} 音頻無流動，觸發修復`);
+                    stagnantCount = 0;
+                    if (!forceRelayMode) {
+                        forceRelayMode = true;
+                        console.warn('🛡️ 開啟 relay-only 回退並重建連線');
+                    }
+                    await autoAttemptConnectionRepair(userId);
+                }
+            } catch (e) {
+                // 忽略一次性錯誤
+            }
+        }, 3000);
+    } catch (e) {
+        console.warn('啟動音頻監控失敗', e);
+    }
+}
+
 // 初始化麦克风状态
 function initializeMicrophoneState() {
     try {
@@ -6477,6 +6573,7 @@ function createEnhancedPeerConnection(userId) {
     }
     
     const peerConnection = new RTCPeerConnection(enhancedConfig);
+    attachCodecPreference(peerConnection);
     
     // 添加本地流
     if (localStream) {
@@ -6544,6 +6641,7 @@ function createEnhancedPeerConnection(userId) {
         }
     }, 30000);
     
+    startPeerAudioMonitor(userId, peerConnection);
     peerConnections.set(userId, peerConnection);
     console.log(`✅ 增强WebRTC连接创建完成 [${userId}]`);
     
