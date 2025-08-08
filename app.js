@@ -950,6 +950,12 @@ function toggleVoiceCall() {
 async function startVoiceCall() {
     try {
         console.log('📞 开始语音通话...');
+        // 清理殘留音頻元素（防止上次通話遺留導致無聲）
+        document.querySelectorAll('audio[data-user-id]').forEach(el => {
+            try { el.pause(); el.srcObject = null; el.remove(); } catch {}
+        });
+        // 開始新通話時恢復到非 relay-only，減少不必要延遲（必要時監控會自動回退）
+        forceRelayMode = false;
         
         // 检查浏览器支持
         if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
